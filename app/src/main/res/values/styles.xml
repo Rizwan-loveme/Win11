@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Same look as before (AppCompat Light), but the window is transparent and shows the
+         device's current wallpaper behind the desktop. -->
+    <style name="Theme.Win11" parent="@style/Theme.AppCompat.Light.DarkActionBar">
+        <item name="android:windowShowWallpaper">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:colorBackgroundCacheHint">@null</item>
+    </style>
+</resources>

@@ -2,6 +2,8 @@ package com.srizwan.win11
 
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.os.BatteryManager
 import android.net.Uri
 import android.provider.Settings
 import android.text.Editable
@@ -48,8 +50,9 @@ import java.util.Locale
 // =====================================================================
 
 object W11 {
-    val TASKBAR = Color.parseColor("#202020")
-    val TASKBAR_BORDER = Color.parseColor("#3A3A3A")
+    // Win11 "Mica" taskbar: near-opaque dark with a hairline top edge
+    val TASKBAR = Color.parseColor("#F2202020")
+    val TASKBAR_BORDER = Color.parseColor("#2E2E2E")
     val ACCENT = Color.parseColor("#4CC2FF")
     val ITEM_ACTIVE_BG = Color.parseColor("#26FFFFFF")
     val DOT = Color.parseColor("#9AFFFFFF")
@@ -71,6 +74,11 @@ class VectorIconView(context: Context, private val type: String) : View(context)
     private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL }
     private var path: Path? = null
     private var color: Int = Color.WHITE
+    private var customColor = false
+    // Windows 11 logo: sky-blue four-pane window (shader lives in the 24x24 icon space)
+    private val logoShader = LinearGradient(
+        0f, 3f, 0f, 21f, Color.parseColor("#7FD8FF"), Color.parseColor("#1E88E8"), Shader.TileMode.CLAMP
+    )
 
     companion object {
         const val START = "start"
@@ -89,6 +97,13 @@ class VectorIconView(context: Context, private val type: String) : View(context)
         const val DELETE = "delete"
         const val BELL = "bell"
         const val DOWNLOAD = "download"
+        const val PERSON = "person"
+        const val BACKSPACE = "backspace"
+        const val FLASH = "flash"
+        const val REFRESH = "refresh"
+        const val CALL_IN = "call_in"
+        const val CALL_OUT = "call_out"
+        const val CALL_MISSED = "call_missed"
 
         private fun data(type: String): String? = when (type) {
             FILES -> "M10,4H4c-1.1,0 -1.99,0.9 -1.99,2L2,18c0,1.1 0.9,2 2,2h16c1.1,0 2,-0.9 2,-2V8c0,-1.1 -0.9,-2 -2,-2h-8l-2,-2z"
@@ -105,6 +120,13 @@ class VectorIconView(context: Context, private val type: String) : View(context)
             BACK -> "M20,11H7.83l5.59,-5.59L12,4l-8,8 8,8 1.41,-1.41L7.83,13H20v-2z"
             DOWNLOAD -> "M19,9h-4V3H9v6H5l7,7 7,-7zM5,18v2h14v-2H5z"
             BELL -> "M12,22c1.1,0 2,-0.9 2,-2h-4c0,1.1 0.89,2 2,2zM18,16v-5c0,-3.07 -1.64,-5.64 -4.5,-6.32V4c0,-0.83 -0.67,-1.5 -1.5,-1.5s-1.5,0.67 -1.5,1.5v0.68C7.63,5.36 6,7.92 6,11v5l-2,2v1h16v-1l-2,-2z"
+            PERSON -> "M12,12c2.21,0 4,-1.79 4,-4s-1.79,-4 -4,-4 -4,1.79 -4,4 1.79,4 4,4zM12,14c-2.67,0 -8,1.34 -8,4v2h16v-2c0,-2.66 -5.33,-4 -8,-4z"
+            BACKSPACE -> "M22,3H7c-0.69,0 -1.23,0.35 -1.59,0.88L0,12l5.41,8.11c0.36,0.53 0.9,0.89 1.59,0.89h15c1.1,0 2,-0.9 2,-2V5c0,-1.1 -0.9,-2 -2,-2zM19,15.59L17.59,17 14,13.41 10.41,17 9,15.59 12.59,12 9,8.41 10.41,7 14,10.59 17.59,7 19,8.41 15.41,12 19,15.59z"
+            FLASH -> "M7,2v11h3v9l7,-12h-4l4,-8z"
+            REFRESH -> "M17.65,6.35C16.2,4.9 14.21,4 12,4c-4.42,0 -7.99,3.58 -7.99,8s3.57,8 7.99,8c3.73,0 6.84,-2.55 7.73,-6h-2.08c-0.82,2.33 -3.04,4 -5.65,4 -3.31,0 -6,-2.69 -6,-6s2.69,-6 6,-6c1.66,0 3.14,0.69 4.22,1.78L13,11h7V4l-2.35,2.35z"
+            CALL_IN -> "M20,5.41L18.59,4 7,15.59V9H5v10h10v-2H8.41z"
+            CALL_OUT -> "M9,5v2h6.59L4,18.59 5.41,20 17,8.41V15h2V5z"
+            CALL_MISSED -> "M19.59,7L12,14.59 6.41,9H11V7H3v8h2v-4.59l7,7 9,-9z"
             DELETE -> "M6,19c0,1.1 0.9,2 2,2h8c1.1,0 2,-0.9 2,-2V7H6v12zM19,4h-3.5l-1,-1h-5l-1,1H5v2h14V4z"
             else -> null
         }
@@ -128,6 +150,7 @@ class VectorIconView(context: Context, private val type: String) : View(context)
 
     fun setIconColor(c: Int) {
         color = c
+        customColor = true
         invalidate()
     }
 
@@ -139,13 +162,54 @@ class VectorIconView(context: Context, private val type: String) : View(context)
         canvas.scale(s, s)
         fill.color = color
         if (type == START) {
-            canvas.drawRoundRect(RectF(3f, 3f, 11.2f, 11.2f), 1.2f, 1.2f, fill)
-            canvas.drawRoundRect(RectF(12.8f, 3f, 21f, 11.2f), 1.2f, 1.2f, fill)
-            canvas.drawRoundRect(RectF(3f, 12.8f, 11.2f, 21f), 1.2f, 1.2f, fill)
-            canvas.drawRoundRect(RectF(12.8f, 12.8f, 21f, 21f), 1.2f, 1.2f, fill)
+            fill.shader = if (customColor) null else logoShader
+            canvas.drawRoundRect(RectF(3f, 3f, 11.3f, 11.3f), 0.7f, 0.7f, fill)
+            canvas.drawRoundRect(RectF(12.7f, 3f, 21f, 11.3f), 0.7f, 0.7f, fill)
+            canvas.drawRoundRect(RectF(3f, 12.7f, 11.3f, 21f), 0.7f, 0.7f, fill)
+            canvas.drawRoundRect(RectF(12.7f, 12.7f, 21f, 21f), 0.7f, 0.7f, fill)
+            fill.shader = null
         } else {
             path?.let { canvas.drawPath(it, fill) }
         }
+        canvas.restore()
+    }
+}
+
+// =====================================================================
+// TRAY BATTERY (horizontal Windows-style battery, real level)
+// =====================================================================
+
+class BatteryIconView(context: Context) : View(context) {
+    private val outline = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; strokeWidth = 1.4f; color = Color.WHITE
+    }
+    private val fill = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.FILL; color = Color.WHITE }
+    private var level = 100
+    private var charging = false
+
+    fun setLevel(l: Int, isCharging: Boolean) {
+        val lv = l.coerceIn(0, 100)
+        if (lv == level && isCharging == charging) return
+        level = lv
+        charging = isCharging
+        invalidate()
+    }
+
+    override fun onDraw(canvas: Canvas) {
+        val s = minOf(width, height) / 24f
+        canvas.save()
+        canvas.translate((width - 24f * s) / 2f, (height - 24f * s) / 2f)
+        canvas.scale(s, s)
+        outline.color = Color.WHITE
+        canvas.drawRoundRect(RectF(1.5f, 6.5f, 20f, 17.5f), 2.4f, 2.4f, outline)
+        canvas.drawRoundRect(RectF(21f, 10f, 22.6f, 14f), 0.8f, 0.8f, fill.apply { color = Color.WHITE })
+        fill.color = when {
+            charging -> Color.parseColor("#6CCB5F")
+            level <= 15 -> Color.parseColor("#FF6B6B")
+            else -> Color.WHITE
+        }
+        val w = 15.4f * level / 100f
+        if (w > 0.5f) canvas.drawRoundRect(RectF(3.3f, 8.3f, 3.3f + w, 15.7f), 1.1f, 1.1f, fill)
         canvas.restore()
     }
 }
@@ -205,6 +269,44 @@ class BloomView(context: Context) : View(context) {
 }
 
 // =====================================================================
+// WINDOW FRAME BACKGROUND
+// On the desktop the device wallpaper shows through (window is transparent), but the
+// status-bar / navigation-bar areas stay dark so their icons remain readable on any wallpaper.
+// Every other section is fully opaque dark, exactly as before.
+// =====================================================================
+
+class DesktopFrameDrawable : android.graphics.drawable.Drawable() {
+    private val paint = Paint().apply { color = Color.parseColor("#202020"); style = Paint.Style.FILL }
+    private var l = 0
+    private var t = 0
+    private var r = 0
+    private var b = 0
+
+    /** true = whole window dark (non-desktop sections); false = only the bar areas are dark. */
+    var solid: Boolean = true
+        set(value) { if (field != value) { field = value; invalidateSelf() } }
+
+    fun setInsets(left: Int, top: Int, right: Int, bottom: Int) {
+        l = left; t = top; r = right; b = bottom
+        invalidateSelf()
+    }
+
+    override fun draw(canvas: Canvas) {
+        val bd = bounds
+        if (solid) { canvas.drawRect(bd, paint); return }
+        if (t > 0) canvas.drawRect(bd.left.toFloat(), bd.top.toFloat(), bd.right.toFloat(), (bd.top + t).toFloat(), paint)
+        if (b > 0) canvas.drawRect(bd.left.toFloat(), (bd.bottom - b).toFloat(), bd.right.toFloat(), bd.bottom.toFloat(), paint)
+        if (l > 0) canvas.drawRect(bd.left.toFloat(), bd.top.toFloat(), (bd.left + l).toFloat(), bd.bottom.toFloat(), paint)
+        if (r > 0) canvas.drawRect((bd.right - r).toFloat(), bd.top.toFloat(), bd.right.toFloat(), bd.bottom.toFloat(), paint)
+    }
+
+    override fun setAlpha(alpha: Int) { paint.alpha = alpha; invalidateSelf() }
+    override fun setColorFilter(cf: android.graphics.ColorFilter?) { paint.colorFilter = cf; invalidateSelf() }
+    @Deprecated("Deprecated in Java")
+    override fun getOpacity(): Int = android.graphics.PixelFormat.TRANSLUCENT
+}
+
+// =====================================================================
 // SHELL: taskbar + desktop
 // =====================================================================
 
@@ -259,11 +361,20 @@ class Win11Shell(
         private set
 
     private var clockView: TextView? = null
+    private var batteryView: BatteryIconView? = null
     private val handler = Handler(Looper.getMainLooper())
     private val tick = object : Runnable {
         override fun run() {
             updateClock()
             handler.postDelayed(this, 15000)
+        }
+    }
+
+    init {
+        // The clone engine starts asynchronously: when it is ready, reload the app list so
+        // existing bKash / Nagad / WhatsApp clones show up.
+        CloneEngine.onReady {
+            handler.post { appRepo.load { changed -> if (changed) refreshAll() } }
         }
     }
 
@@ -281,9 +392,27 @@ class Win11Shell(
         val t = SimpleDateFormat("h:mm a", Locale.getDefault()).format(now)
         val d = SimpleDateFormat("M/d/yyyy", Locale.getDefault()).format(now)
         clockView?.text = "$t\n$d"
+        updateBattery()
     }
 
-    // ── Taskbar ──────────────────────────────────────────────────
+    private fun updateBattery() {
+        try {
+            val i = ctx.registerReceiver(null, IntentFilter(Intent.ACTION_BATTERY_CHANGED)) ?: return
+            val level = i.getIntExtra(BatteryManager.EXTRA_LEVEL, -1)
+            val scale = i.getIntExtra(BatteryManager.EXTRA_SCALE, 100)
+            val status = i.getIntExtra(BatteryManager.EXTRA_STATUS, -1)
+            if (level >= 0 && scale > 0) {
+                val charging = status == BatteryManager.BATTERY_STATUS_CHARGING ||
+                    status == BatteryManager.BATTERY_STATUS_FULL
+                batteryView?.setLevel(level * 100 / scale, charging)
+            }
+        } catch (e: Exception) { }
+    }
+
+    // ── Taskbar (Windows 11 style) ───────────────────────────────
+    //   [ spacer ] [ ⊞  📁  🌐  📞  💬 ] centred  [ wifi volume battery ] [ time / date ]
+
+    private var itemSize = 40
 
     fun buildTaskbar(): LinearLayout {
         val outer = LinearLayout(ctx).apply {
@@ -302,13 +431,23 @@ class Win11Shell(
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(52)
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(48)
             )
         }
 
-        // left spacer keeps the icon group truly centered
+        // ── right side first, so we know how much room the centred icons get ──
+        val trayWidthDp = 62
+        val clockWidthDp = 66
+        val screenDp = ctx.resources.configuration.screenWidthDp.takeIf { it > 0 } ?: 360
+        val rightDp = trayWidthDp + clockWidthDp
+        itemSize = (((screenDp - rightDp - 4) / 5) - 4).coerceIn(32, 40)
+        val groupDp = 5 * (itemSize + 4)
+        val freeDp = screenDp - groupDp - rightDp
+        val leftDp = minOf(rightDp, maxOf(0, freeDp / 2))
+
+        // left spacer keeps the icon group centred as far as the screen allows
         row.addView(View(ctx).apply {
-            layoutParams = LinearLayout.LayoutParams(dp(60), ViewGroup.LayoutParams.MATCH_PARENT)
+            layoutParams = LinearLayout.LayoutParams(dp(leftDp), ViewGroup.LayoutParams.MATCH_PARENT)
         })
 
         val center = LinearLayout(ctx).apply {
@@ -323,14 +462,48 @@ class Win11Shell(
         center.addView(makeItem("sms", VectorIconView.MESSAGES))
         row.addView(center)
 
-        // system tray clock (right)
+        // ── system tray: wifi / volume / battery ──
+        val tray = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER
+            setPadding(dp(3), 0, dp(3), 0)
+            layoutParams = LinearLayout.LayoutParams(dp(trayWidthDp), dp(40))
+            background = GradientDrawable().apply {
+                cornerRadius = dpf(4f)
+                setColor(Color.TRANSPARENT)
+            }
+        }
+        fun trayIcon(type: String, sizeDp: Int): VectorIconView =
+            VectorIconView(ctx, type).apply {
+                setIconColor(Color.WHITE)
+                layoutParams = LinearLayout.LayoutParams(dp(sizeDp), dp(sizeDp)).apply {
+                    setMargins(dp(2), 0, dp(2), 0)
+                }
+            }
+        tray.addView(trayIcon(VectorIconView.WIFI, 15))
+        tray.addView(trayIcon(VectorIconView.VOLUME, 15))
+        val battery = BatteryIconView(ctx).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(18), dp(18)).apply {
+                setMargins(dp(2), 0, dp(2), 0)
+            }
+        }
+        batteryView = battery
+        tray.addView(battery)
+        row.addView(tray)
+
+        // ── clock (time over date, right aligned like Windows) ──
         clockView = TextView(ctx).apply {
             setTextColor(W11.TEXT)
-            textSize = 10.5f
+            textSize = 10f
             typeface = Typeface.DEFAULT
+            setLineSpacing(0f, 0.95f)
+            maxLines = 2
             gravity = Gravity.END or Gravity.CENTER_VERTICAL
-            setPadding(0, 0, dp(10), 0)
-            layoutParams = LinearLayout.LayoutParams(dp(74), ViewGroup.LayoutParams.MATCH_PARENT)
+            setPadding(dp(4), 0, dp(8), 0)
+            minWidth = dp(clockWidthDp - 6)
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT
+            )
         }
         row.addView(clockView)
         outer.addView(row)
@@ -342,27 +515,30 @@ class Win11Shell(
 
     private fun makeItem(key: String, iconType: String): FrameLayout {
         val frame = FrameLayout(ctx).apply {
-            layoutParams = LinearLayout.LayoutParams(dp(46), dp(46)).apply {
-                setMargins(dp(1), 0, dp(1), 0)
+            layoutParams = LinearLayout.LayoutParams(dp(itemSize), dp(itemSize)).apply {
+                setMargins(dp(2), 0, dp(2), 0)
             }
         }
+        val iconSize = if (itemSize >= 38) 22 else 20
         val icon = VectorIconView(ctx, iconType).apply {
-            layoutParams = FrameLayout.LayoutParams(dp(24), dp(24), Gravity.CENTER)
+            layoutParams = FrameLayout.LayoutParams(dp(iconSize), dp(iconSize), Gravity.CENTER)
         }
+        // Windows 11 running-app marker: small dot, grows into a pill when the app is active
         val indicator = View(ctx).apply {
             layoutParams = FrameLayout.LayoutParams(dp(6), dp(3), Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
-                bottomMargin = dp(2)
+                bottomMargin = dp(1)
             }
             visibility = View.GONE
         }
         frame.addView(icon)
         frame.addView(indicator)
 
-        frame.setOnTouchListener { v, e ->
+        // press feedback: icon shrinks slightly, like the Windows 11 taskbar
+        frame.setOnTouchListener { _, e ->
             when (e.action) {
-                MotionEvent.ACTION_DOWN -> v.animate().scaleX(0.85f).scaleY(0.85f).setDuration(80).start()
+                MotionEvent.ACTION_DOWN -> icon.animate().scaleX(0.82f).scaleY(0.82f).setDuration(70).start()
                 MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL ->
-                    v.animate().scaleX(1f).scaleY(1f).setDuration(120).start()
+                    icon.animate().scaleX(1f).scaleY(1f).setDuration(120).start()
             }
             false
         }
@@ -379,13 +555,13 @@ class Win11Shell(
             val isActive = key == active || (key == "start" && startOpen)
             val isRunning = key in running
             item.frame.background = if (isActive) GradientDrawable().apply {
-                cornerRadius = dpf(6f)
+                cornerRadius = dpf(4f)
                 setColor(W11.ITEM_ACTIVE_BG)
             } else null
             val lp = item.indicator.layoutParams as FrameLayout.LayoutParams
             when {
                 isActive && key != "start" -> {
-                    lp.width = dp(16)
+                    lp.width = dp(14)
                     item.indicator.background = pill(W11.ACCENT)
                     item.indicator.visibility = View.VISIBLE
                 }
@@ -403,7 +579,7 @@ class Win11Shell(
     private fun dpf(v: Float): Float = v * density
 
     private fun pill(c: Int): GradientDrawable = GradientDrawable().apply {
-        cornerRadius = dpf(2f)
+        cornerRadius = dpf(1.5f)
         setColor(c)
     }
 
@@ -1197,7 +1373,8 @@ class Win11Shell(
             menu.menu.add(0, 2, 0, if (appRepo.isPinned(e)) "Unpin from Start" else "Pin to Start")
             menu.menu.add(0, 3, 1, "Hide app")
         }
-        if (!e.isBuiltIn) menu.menu.add(0, 4, 2, "App info")
+        if (!e.isBuiltIn && !e.isClone) menu.menu.add(0, 4, 2, "App info")
+        addCloneMenuItems(menu, e)
         menu.setOnMenuItemClickListener { item ->
             when (item.itemId) {
                 1 -> { appRepo.unhide(e); refreshAllApps() }
@@ -1207,10 +1384,70 @@ class Win11Shell(
                     Toast.makeText(ctx, "${e.label} hidden. Find it under Hidden apps.", Toast.LENGTH_SHORT).show()
                 }
                 4 -> openAppInfo(e)
+                6, 7, 8 -> handleCloneMenu(item.itemId, e)
             }
             true
         }
         menu.show()
+    }
+
+    // ── Clone (Parallel engine): any app except bKash / Nagad / WhatsApp ────
+
+    /** Adds the clone entries to a long-press menu (ids 6 = clone, 7 = clear data, 8 = remove). */
+    private fun addCloneMenuItems(menu: PopupMenu, e: AppEntry) {
+        if (e.isClone) {
+            menu.menu.add(0, 7, 6, "Clear clone data")
+            menu.menu.add(0, 8, 7, "Remove clone")
+        } else if (!e.isBuiltIn && CloneEngine.isAllowed(e.pkg)) {
+            menu.menu.add(0, 6, 5, "Clone app")
+        }
+    }
+
+    private fun handleCloneMenu(id: Int, e: AppEntry) {
+        when (id) {
+            6 -> cloneApp(e)
+            7 -> confirmClone("Clear data of ${e.label}?", "Clear") {
+                CloneEngine.io.execute {
+                    CloneEngine.clearData(e.pkg, e.cloneUserId)
+                    handler.post { Toast.makeText(ctx, "Data cleared", Toast.LENGTH_SHORT).show() }
+                }
+            }
+            8 -> confirmClone("Remove ${e.label}? Its data will be deleted.", "Remove") {
+                CloneEngine.io.execute {
+                    CloneEngine.remove(e.pkg, e.cloneUserId)
+                    handler.post { reloadApps() }
+                }
+            }
+        }
+    }
+
+    private fun confirmClone(message: String, action: String, onYes: () -> Unit) {
+        try {
+            AlertDialog.Builder(ctx)
+                .setMessage(message)
+                .setPositiveButton(action) { _, _ -> onYes() }
+                .setNegativeButton("Cancel", null)
+                .show()
+        } catch (ex: Exception) { }
+    }
+
+    private fun cloneApp(e: AppEntry) {
+        Toast.makeText(ctx, "Cloning ${e.label}…", Toast.LENGTH_SHORT).show()
+        CloneEngine.io.execute {
+            val err = CloneEngine.clone(e.pkg)
+            handler.post {
+                if (err == null) {
+                    Toast.makeText(ctx, "${e.label} cloned", Toast.LENGTH_SHORT).show()
+                    reloadApps()
+                } else {
+                    Toast.makeText(ctx, err, Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
+    private fun reloadApps() {
+        appRepo.load { changed -> if (changed) refreshAll() }
     }
 
     private fun openAppInfo(e: AppEntry) {
@@ -1308,6 +1545,17 @@ class Win11Shell(
     }
 
     fun launchApp(e: AppEntry) {
+        // Clones (bKash / Nagad / WhatsApp) open inside the virtual space
+        if (e.isClone) {
+            closeStart(animated = false)
+            CloneEngine.io.execute {
+                val ok = CloneEngine.launch(e.pkg, e.cloneUserId)
+                if (!ok) handler.post {
+                    Toast.makeText(ctx, "Can't open ${e.label}", Toast.LENGTH_SHORT).show()
+                }
+            }
+            return
+        }
         // Built-in apps (e.g. Browser) open inside Win11 itself
         e.section?.let { sec ->
             closeStart(animated = false)
@@ -1327,9 +1575,11 @@ class Win11Shell(
         menu.menu.add(0, 1, 0, "Unpin from Start")
         menu.menu.add(0, 2, 1, "Move to front")
         menu.menu.add(0, 5, 2, "Hide app")
-        if (!e.isBuiltIn) menu.menu.add(0, 3, 3, "App info")
+        if (!e.isBuiltIn && !e.isClone) menu.menu.add(0, 3, 3, "App info")
+        addCloneMenuItems(menu, e)
         menu.setOnMenuItemClickListener { item ->
             when (item.itemId) {
+                6, 7, 8 -> handleCloneMenu(item.itemId, e)
                 1 -> { appRepo.unpin(e); refreshPinnedGrid() }
                 2 -> { appRepo.moveToFront(e); refreshPinnedGrid() }
                 3 -> openAppInfo(e)
@@ -1351,11 +1601,9 @@ class Win11Shell(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
             )
         }
-        desktop.addView(BloomView(ctx).apply {
-            layoutParams = FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
-            )
-        })
+        // No drawn wallpaper: the window theme (Theme.Win11, windowShowWallpaper) shows the
+        // device's current wallpaper behind the desktop icons. BloomView is kept above as an
+        // unused fallback.
 
         val column = LinearLayout(ctx).apply {
             orientation = LinearLayout.VERTICAL

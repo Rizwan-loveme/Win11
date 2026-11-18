@@ -136,6 +136,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tabLayout: LinearLayout
     private lateinit var contentFrame: FrameLayout
     private lateinit var shell: Win11Shell
+    private val frameBg = DesktopFrameDrawable()
     private lateinit var desktopView: FrameLayout
 
     // ── File manager ─────────────────────────────────────────────
@@ -165,6 +166,7 @@ class MainActivity : AppCompatActivity() {
     // ── Phone / SMS / Contacts / Flashlight ──────────────────────
     private lateinit var dialerView: LinearLayout
     private lateinit var smsView: LinearLayout
+    private lateinit var smsUi: SmsUi
     private var isTorchOn = false
     private var cameraManager: CameraManager? = null
     private var cameraId: String? = null
@@ -212,6 +214,7 @@ class MainActivity : AppCompatActivity() {
     private val REQ_CALL = 201
     private val REQ_SMS = 202
     private val REQ_CONTACTS = 203
+    private val REQ_CALL_LOG = 204
 
     data class WebTab(
         val webView: WebView,
@@ -291,12 +294,15 @@ class MainActivity : AppCompatActivity() {
     override fun onPause() {
         super.onPause()
         saveState()
+        if (::smsUi.isInitialized) smsUi.onHidden()
         webTabs.forEach { try { it.webView.onPause() } catch (e: Exception) { } }
     }
 
     override fun onResume() {
         super.onResume()
         if (isUIInitialized) ViewCompat.requestApplyInsets(rootLayout)
+        if (isUIInitialized && activeSection == "dialer") refreshRecentCalls()
+        if (isUIInitialized && activeSection == "sms" && ::smsUi.isInitialized) smsUi.onShown()
         webTabs.getOrNull(currentTabIndex)?.let {
             try { it.webView.onResume() } catch (e: Exception) { }
         }
@@ -321,6 +327,7 @@ class MainActivity : AppCompatActivity() {
         unregisterChatReceiver()
         try { DlEngine.removeListener(dlListener); if (::downloadsUi.isInitialized) downloadsUi.onHide() } catch (e: Exception) { }
         releaseTorch()
+        try { if (::smsUi.isInitialized) smsUi.destroy() } catch (e: Exception) { }
         pipHideHandler?.removeCallbacks(pipHideRunnable ?: Runnable { })
         super.onDestroy()
     }
@@ -381,10 +388,7 @@ class MainActivity : AppCompatActivity() {
         try {
             isTorchOn = !isTorchOn
             cameraManager!!.setTorchMode(cameraId!!, isTorchOn)
-            btn?.text = if (isTorchOn) "🔦 OFF" else "🔦 ON"
-            btn?.setBackgroundColor(
-                if (isTorchOn) Color.parseColor("#FFC107") else Color.parseColor("#444444")
-            )
+            styleTorchBtn(btn)
         } catch (e: CameraAccessException) {
             Toast.makeText(this, "Torch error: ${e.message}", Toast.LENGTH_SHORT).show()
             isTorchOn = false
@@ -554,12 +558,13 @@ class MainActivity : AppCompatActivity() {
             }
             REQ_SMS -> {
                 if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                    refreshSmsView()
+                    if (::smsUi.isInitialized) smsUi.refresh()
                 } else {
                     Toast.makeText(this, "SMS permission denied", Toast.LENGTH_SHORT).show()
                 }
             }
             REQ_CONTACTS -> { /* refreshed on next open */ }
+            REQ_CALL_LOG -> refreshRecentCalls()
         }
     }
 
@@ -579,7 +584,7 @@ class MainActivity : AppCompatActivity() {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.MATCH_PARENT
             )
-            setBackgroundColor(Color.parseColor("#202020"))
+            background = frameBg
         }
 
         // ── Win11 taskbar (bottom) ── ──────────────────────────────────────
@@ -607,7 +612,19 @@ class MainActivity : AppCompatActivity() {
         fileManagerView = createFileManagerView()
         browserView = createBrowserView()
         dialerView = createDialerView()
-        smsView = createSmsView()
+        smsUi = SmsUi(
+            act = this,
+            onCall = { number ->
+                dialInput?.setText(number)
+                switchToSection("dialer")
+            },
+            onNeedPermission = {
+                ActivityCompat.requestPermissions(
+                    this, arrayOf(PERM_SMS_R, PERM_SMS_S, PERM_SMS_R2), REQ_SMS
+                )
+            }
+        )
+        smsView = smsUi.root
 
         contentFrame.addView(desktopView)
         contentFrame.addView(fileManagerView)
@@ -644,6 +661,7 @@ class MainActivity : AppCompatActivity() {
                 bars.left, bars.top, bars.right,
                 maxOf(bars.bottom, ime.bottom, legacyBottom)
             )
+            frameBg.setInsets(bars.left, bars.top, bars.right, maxOf(bars.bottom, ime.bottom, legacyBottom))
             WindowInsetsCompat.CONSUMED
         }
         try {
@@ -693,11 +711,14 @@ class MainActivity : AppCompatActivity() {
     private fun switchToSection(section: String) {
         val target = if (section == "start") "desktop" else section
         activeSection = target
+        // Desktop: wallpaper shows through. Every other section: opaque dark, as before.
+        frameBg.solid = target != "desktop"
         desktopView.visibility = View.GONE
         fileManagerView.visibility = View.GONE
         browserView.visibility = View.GONE
         dialerView.visibility = View.GONE
         smsView.visibility = View.GONE
+        if (target != "sms" && ::smsUi.isInitialized) smsUi.onHidden()
         hideDownloads()
 
         when (target) {
@@ -719,11 +740,12 @@ class MainActivity : AppCompatActivity() {
             "dialer" -> {
                 dialerView.visibility = View.VISIBLE
                 highlightTab(2)
+                refreshRecentCalls()
             }
             "sms" -> {
                 smsView.visibility = View.VISIBLE
                 highlightTab(3)
-                refreshSmsView()
+                smsUi.onShown()
             }
         }
     }
@@ -903,177 +925,365 @@ class MainActivity : AppCompatActivity() {
 
     private var dialInput: EditText? = null
     private var torchBtn: Button? = null
+    private var dialRecentContainer: LinearLayout? = null
+    private var dialRecentSearch: EditText? = null
 
-    private fun createDialerView(): LinearLayout {
-        val layout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#121212"))
-            layoutParams = ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
-            )
-        }
+    /** Wide screens: recent calls on the left, dialer on the right (PC layout). Narrow: one column. */
+    private val dialWide: Boolean
+        get() = resources.configuration.screenWidthDp >= 560
 
-        // ── Header ──
-        val header = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(Color.parseColor("#1E1E1E"))
-            setPadding(dp(16), dp(12), dp(16), dp(12))
-            gravity = Gravity.CENTER_VERTICAL
-        }
-        val headerTitle = TextView(this).apply {
-            text = "📞 Phone & Flashlight"
-            textSize = 18f
+    /** Flashlight pill: grey when off, yellow when on. */
+    private fun styleTorchBtn(btn: Button?) {
+        btn ?: return
+        btn.text = if (isTorchOn) "🔦 Flashlight ON" else "🔦 Flashlight"
+        btn.setTextColor(if (isTorchOn) Color.BLACK else Color.WHITE)
+        btn.background = smsRound(
+            if (isTorchOn) Color.parseColor("#FFC107") else Color.parseColor("#3A3A3A"), 15
+        )
+    }
+
+    private fun dialAppend(ch: String) {
+        val e = dialInput ?: return
+        e.append(ch)
+        e.setSelection(e.text.length)
+    }
+
+    private fun dialSetNumber(num: String) {
+        val e = dialInput ?: return
+        e.setText(num)
+        e.setSelection(e.text.length)
+    }
+
+    /** One keypad key: big digit + small letters (like the Windows Phone Link dialer). */
+    private fun dialKey(
+        main: String, sub: String, onClick: () -> Unit, onLong: (() -> Boolean)? = null
+    ): LinearLayout {
+        val normal = Color.parseColor("#323232")
+        val pressed = Color.parseColor("#454545")
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.VERTICAL
+        box.gravity = Gravity.CENTER
+        box.background = smsRound(normal, 8)
+        box.isClickable = true
+        box.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
+            .apply { setMargins(dp(3), 0, dp(3), 0) }
+        box.addView(TextView(this).apply {
+            text = main
+            textSize = 22f
             typeface = Typeface.DEFAULT_BOLD
             setTextColor(Color.WHITE)
-            layoutParams =
-                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            gravity = Gravity.CENTER
+        })
+        if (sub.isNotEmpty()) {
+            box.addView(TextView(this).apply {
+                text = sub
+                textSize = 9f
+                letterSpacing = 0.12f
+                setTextColor(W11.TEXT_DIM)
+                gravity = Gravity.CENTER
+            })
         }
-        torchBtn = Button(this).apply {
-            text = "🔦 ON"
-            setBackgroundColor(Color.parseColor("#444444"))
-            setTextColor(Color.WHITE)
-            textSize = 13f
-            layoutParams = LinearLayout.LayoutParams(dp(90), dp(40))
-            setOnClickListener { toggleTorch(this) }
+        box.setOnClickListener { onClick() }
+        if (onLong != null) box.setOnLongClickListener { onLong() }
+        box.setOnTouchListener { v, ev ->
+            when (ev.action) {
+                android.view.MotionEvent.ACTION_DOWN -> v.background = smsRound(pressed, 8)
+                android.view.MotionEvent.ACTION_UP,
+                android.view.MotionEvent.ACTION_CANCEL -> v.background = smsRound(normal, 8)
+            }
+            false
         }
-        header.addView(headerTitle)
-        header.addView(torchBtn)
-        layout.addView(header)
+        return box
+    }
 
-        // ── Scroll ──
-        val scroll = ScrollView(this).apply {
-            layoutParams =
-                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+    /** Bottom-row key (backspace / call / contacts) with a vector icon and optional label. */
+    private fun dialActionKey(
+        iconType: String, iconColor: Int, bg: Int, weight: Float, label: String?,
+        onClick: () -> Unit
+    ): LinearLayout {
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.HORIZONTAL
+        box.gravity = Gravity.CENTER
+        box.background = smsRound(bg, 8)
+        box.isClickable = true
+        box.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, weight)
+            .apply { setMargins(dp(3), 0, dp(3), 0) }
+        val ic = VectorIconView(this, iconType)
+        ic.setIconColor(iconColor)
+        ic.layoutParams = LinearLayout.LayoutParams(dp(22), dp(22))
+        box.addView(ic)
+        if (label != null) {
+            box.addView(TextView(this).apply {
+                text = label
+                textSize = 16f
+                typeface = Typeface.DEFAULT_BOLD
+                setTextColor(iconColor)
+                setPadding(dp(8), 0, 0, 0)
+            })
         }
-        val inner = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(16), dp(12), dp(16), dp(16))
-            setBackgroundColor(Color.parseColor("#121212"))
+        box.setOnClickListener { onClick() }
+        box.setOnTouchListener { v, ev ->
+            when (ev.action) {
+                android.view.MotionEvent.ACTION_DOWN -> v.alpha = 0.75f
+                android.view.MotionEvent.ACTION_UP,
+                android.view.MotionEvent.ACTION_CANCEL -> v.alpha = 1f
+            }
+            false
         }
+        return box
+    }
+
+    /** Number display + keypad + action row. */
+    private fun buildDialerCard(): LinearLayout {
+        val mp = ViewGroup.LayoutParams.MATCH_PARENT
+        val card = LinearLayout(this)
+        card.orientation = LinearLayout.VERTICAL
+        card.background = smsRound(Color.parseColor("#272727"), 8)
+        card.setPadding(dp(12), dp(12), dp(12), dp(12))
 
         // ── Display field ──
         dialInput = EditText(this).apply {
             hint = "Number / name"
-            textSize = 22f
+            textSize = 26f
             gravity = Gravity.CENTER
+            maxLines = 1
+            setSingleLine(true)
             setTextColor(Color.WHITE)
-            setHintTextColor(Color.GRAY)
-            setBackgroundColor(Color.parseColor("#1E1E1E"))
-            setPadding(dp(12), dp(12), dp(12), dp(12))
+            setHintTextColor(Color.parseColor("#80FFFFFF"))
+            background = smsRound(Color.parseColor("#1F1F1F"), 6)
+            setPadding(dp(12), 0, dp(12), 0)
             isFocusable = true
             isFocusableInTouchMode = true
-            layoutParams =
-                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(60))
+            imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_DONE
+            setOnEditorActionListener { _, _, _ -> makeCall(); true }
+            layoutParams = LinearLayout.LayoutParams(mp, dp(60))
         }
-        inner.addView(dialInput)
-        inner.addView(View(this).apply {
-            layoutParams =
-                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(10))
+        card.addView(dialInput)
+        card.addView(View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(mp, dp(10))
         })
 
-        // ── Numpad ──
-        val numpadRows =
-            listOf(listOf("1", "2", "3"), listOf("4", "5", "6"), listOf("7", "8", "9"), listOf("*", "0", "#"))
-        for (row in numpadRows) {
+        // ── Keypad ──
+        val rows = listOf(
+            listOf("1" to "", "2" to "ABC", "3" to "DEF"),
+            listOf("4" to "GHI", "5" to "JKL", "6" to "MNO"),
+            listOf("7" to "PQRS", "8" to "TUV", "9" to "WXYZ"),
+            listOf("*" to "", "0" to "+", "#" to "")
+        )
+        for (row in rows) {
             val rowLayout = LinearLayout(this).apply {
                 orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER
-                layoutParams =
-                    LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(64)).apply {
-                        setMargins(0, dp(4), 0, dp(4))
-                    }
-            }
-            for (digit in row) {
-                val btn = Button(this).apply {
-                    text = digit
-                    textSize = 22f
-                    typeface = Typeface.DEFAULT_BOLD
-                    setTextColor(Color.WHITE)
-                    setBackgroundColor(Color.parseColor("#2A2A2A"))
-                    layoutParams =
-                        LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f).apply {
-                            setMargins(dp(4), 0, dp(4), 0)
-                        }
-                    setOnClickListener { dialInput?.append(digit) }
+                layoutParams = LinearLayout.LayoutParams(mp, dp(60)).apply {
+                    setMargins(0, dp(3), 0, dp(3))
                 }
-                rowLayout.addView(btn)
             }
-            inner.addView(rowLayout)
+            for ((digit, letters) in row) {
+                rowLayout.addView(
+                    dialKey(
+                        digit, letters, { dialAppend(digit) },
+                        // long-press 0 types "+" (international numbers)
+                        if (digit == "0") ({ dialAppend("+"); true }) else null
+                    )
+                )
+            }
+            card.addView(rowLayout)
         }
 
-        // ── Action row ──
-        inner.addView(View(this).apply {
-            layoutParams =
-                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(8))
+        // ── Action row: backspace | call | contacts ──
+        card.addView(View(this).apply {
+            layoutParams = LinearLayout.LayoutParams(mp, dp(6))
         })
         val actionRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER
-            layoutParams =
-                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(64))
+            layoutParams = LinearLayout.LayoutParams(mp, dp(60))
         }
-
-        val deleteBtn = Button(this).apply {
-            text = "⌫"
-            textSize = 22f
-            setTextColor(Color.WHITE)
-            setBackgroundColor(Color.parseColor("#333333"))
-            layoutParams =
-                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f).apply {
-                    setMargins(dp(4), 0, dp(4), 0)
-                }
-            setOnClickListener {
-                val s = dialInput?.text ?: return@setOnClickListener
-                if (s.isNotEmpty()) dialInput?.setText(s.dropLast(1))
+        val deleteBtn = dialActionKey(
+            VectorIconView.BACKSPACE, Color.WHITE, Color.parseColor("#3A3A3A"), 1f, null
+        ) {
+            val e = dialInput
+            if (e != null && e.text.isNotEmpty()) {
+                e.setText(e.text.dropLast(1))
+                e.setSelection(e.text.length)
             }
-            setOnLongClickListener { dialInput?.setText(""); true }
         }
-        val callBtn = Button(this).apply {
-            text = "📞 Call"
-            textSize = 18f
-            typeface = Typeface.DEFAULT_BOLD
-            setTextColor(Color.WHITE)
-            setBackgroundColor(Color.parseColor("#4CAF50"))
-            layoutParams =
-                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 2f).apply {
-                    setMargins(dp(4), 0, dp(4), 0)
-                }
-            setOnClickListener { makeCall() }
-        }
-        val contactsBtn = Button(this).apply {
-            text = "👤"
-            textSize = 22f
-            setTextColor(Color.WHITE)
-            setBackgroundColor(Color.parseColor("#1565C0"))
-            layoutParams =
-                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f).apply {
-                    setMargins(dp(4), 0, dp(4), 0)
-                }
-            setOnClickListener { openContactPicker() }
-        }
+        deleteBtn.setOnLongClickListener { dialInput?.setText(""); true }
+        val callBtn = dialActionKey(
+            VectorIconView.PHONE, Color.WHITE, Color.parseColor("#2E9E43"), 2f, "Call"
+        ) { makeCall() }
+        val contactsBtn = dialActionKey(
+            VectorIconView.PERSON, Color.BLACK, W11.ACCENT, 1f, null
+        ) { openContactPicker() }
         actionRow.addView(deleteBtn)
         actionRow.addView(callBtn)
         actionRow.addView(contactsBtn)
-        inner.addView(actionRow)
+        card.addView(actionRow)
+        return card
+    }
 
-        // ── Recent calls ──
-        inner.addView(View(this).apply {
-            layoutParams =
-                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(16))
-        })
-        val recentTitle = TextView(this).apply {
-            text = "📋 Recent Calls"
+    /** "Recent" header + search + the call list. [scrollable] = false when it sits inside another scroll view. */
+    private fun buildRecentPane(scrollable: Boolean): LinearLayout {
+        val mp = ViewGroup.LayoutParams.MATCH_PARENT
+        val wc = ViewGroup.LayoutParams.WRAP_CONTENT
+        val pane = LinearLayout(this)
+        pane.orientation = LinearLayout.VERTICAL
+
+        val head = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(12), dp(10), dp(8), dp(4))
+            layoutParams = LinearLayout.LayoutParams(mp, wc)
+        }
+        head.addView(TextView(this).apply {
+            text = "Recent calls"
             textSize = 14f
             typeface = Typeface.DEFAULT_BOLD
-            setTextColor(Color.parseColor("#AAAAAA"))
-            setPadding(0, 0, 0, dp(8))
-        }
-        inner.addView(recentTitle)
-        inner.addView(buildRecentCallsView())
+            setTextColor(Color.WHITE)
+            layoutParams = LinearLayout.LayoutParams(0, wc, 1f)
+        })
+        head.addView(smsIconButton(VectorIconView.REFRESH, 32, W11.TEXT_DIM, null) {
+            refreshRecentCalls()
+        })
+        pane.addView(head)
 
-        scroll.addView(inner)
-        layout.addView(scroll)
-        return layout
+        val searchBox = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = smsRound(Color.parseColor("#333333"), 6)
+            setPadding(dp(10), 0, dp(10), 0)
+            layoutParams = LinearLayout.LayoutParams(mp, dp(36)).apply {
+                setMargins(dp(10), dp(4), dp(10), dp(6))
+            }
+        }
+        val sIcon = VectorIconView(this, VectorIconView.SEARCH)
+        sIcon.setIconColor(W11.TEXT_DIM)
+        sIcon.layoutParams = LinearLayout.LayoutParams(dp(14), dp(14))
+        searchBox.addView(sIcon)
+        dialRecentSearch = EditText(this).apply {
+            hint = "Search calls"
+            textSize = 13f
+            maxLines = 1
+            setSingleLine(true)
+            setTextColor(Color.WHITE)
+            setHintTextColor(Color.parseColor("#80FFFFFF"))
+            setBackgroundColor(Color.TRANSPARENT)
+            setPadding(dp(8), 0, 0, 0)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
+            addTextChangedListener(object : android.text.TextWatcher {
+                override fun afterTextChanged(s: android.text.Editable?) { refreshRecentCalls() }
+                override fun beforeTextChanged(s: CharSequence?, st: Int, c: Int, a: Int) {}
+                override fun onTextChanged(s: CharSequence?, st: Int, b: Int, c: Int) {}
+            })
+        }
+        searchBox.addView(dialRecentSearch)
+        pane.addView(searchBox)
+
+        val list = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        dialRecentContainer = list
+        if (scrollable) {
+            val sc = ScrollView(this).apply {
+                isVerticalScrollBarEnabled = false
+                layoutParams = LinearLayout.LayoutParams(mp, 0, 1f)
+            }
+            sc.addView(list)
+            pane.addView(sc)
+        } else {
+            pane.addView(list)
+        }
+        return pane
+    }
+
+    private fun createDialerView(): LinearLayout {
+        val mp = ViewGroup.LayoutParams.MATCH_PARENT
+        val wc = ViewGroup.LayoutParams.WRAP_CONTENT
+
+        val root = LinearLayout(this)
+        root.orientation = LinearLayout.VERTICAL
+        root.setBackgroundColor(Color.parseColor("#202020"))
+        root.layoutParams = ViewGroup.LayoutParams(mp, mp)
+
+        // ── Window title bar: Phone + Flashlight ──
+        val titleBar = LinearLayout(this)
+        titleBar.orientation = LinearLayout.HORIZONTAL
+        titleBar.gravity = Gravity.CENTER_VERTICAL
+        titleBar.setPadding(dp(14), 0, dp(12), 0)
+        titleBar.layoutParams = LinearLayout.LayoutParams(mp, dp(44))
+        val titleIcon = VectorIconView(this, VectorIconView.PHONE)
+        titleIcon.layoutParams = LinearLayout.LayoutParams(dp(16), dp(16))
+        titleBar.addView(titleIcon)
+        titleBar.addView(TextView(this).apply {
+            text = "Phone"
+            setTextColor(W11.TEXT)
+            textSize = 12f
+            setPadding(dp(10), 0, 0, 0)
+            layoutParams = LinearLayout.LayoutParams(0, wc, 1f)
+        })
+        torchBtn = Button(this).apply {
+            isAllCaps = false
+            textSize = 12f
+            minHeight = 0
+            minimumHeight = 0
+            minWidth = 0
+            minimumWidth = 0
+            stateListAnimator = null
+            setPadding(dp(12), 0, dp(12), 0)
+            layoutParams = LinearLayout.LayoutParams(wc, dp(30))
+            setOnClickListener { toggleTorch(this) }
+        }
+        styleTorchBtn(torchBtn)
+        titleBar.addView(torchBtn)
+        root.addView(titleBar)
+
+        if (dialWide) {
+            // ── PC layout: recent calls (left) | dialer (right) ──
+            val body = LinearLayout(this)
+            body.orientation = LinearLayout.HORIZONTAL
+            body.layoutParams = LinearLayout.LayoutParams(mp, 0, 1f)
+
+            val left = buildRecentPane(true)
+            left.setBackgroundColor(Color.parseColor("#272727"))
+            left.layoutParams = LinearLayout.LayoutParams(dp(320), mp)
+            body.addView(left)
+            body.addView(View(this).apply {
+                setBackgroundColor(W11.DIVIDER)
+                layoutParams = LinearLayout.LayoutParams(dp(1), mp)
+            })
+
+            val right = ScrollView(this)
+            right.isFillViewport = true
+            right.setBackgroundColor(Color.parseColor("#1F1F1F"))
+            right.layoutParams = LinearLayout.LayoutParams(0, mp, 1f)
+            val holder = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                gravity = Gravity.CENTER
+                setPadding(dp(16), dp(16), dp(16), dp(16))
+            }
+            val card = buildDialerCard()
+            card.layoutParams = LinearLayout.LayoutParams(dp(360), wc)
+            holder.addView(card)
+            right.addView(holder)
+            body.addView(right)
+            root.addView(body)
+        } else {
+            // ── Phone layout: dialer on top, recent calls below ──
+            val scroll = ScrollView(this)
+            scroll.isVerticalScrollBarEnabled = false
+            scroll.layoutParams = LinearLayout.LayoutParams(mp, 0, 1f)
+            val inner = LinearLayout(this).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(10), dp(8), dp(10), dp(14))
+            }
+            inner.addView(buildDialerCard())
+            inner.addView(View(this).apply {
+                layoutParams = LinearLayout.LayoutParams(mp, dp(10))
+            })
+            val recent = buildRecentPane(false)
+            recent.background = smsRound(Color.parseColor("#272727"), 8)
+            inner.addView(recent)
+            scroll.addView(inner)
+            root.addView(scroll)
+        }
+        refreshRecentCalls()
+        return root
     }
 
     private fun makeCall() {
@@ -1206,22 +1416,47 @@ class MainActivity : AppCompatActivity() {
         dialog.show()
     }
 
-    private fun buildRecentCallsView(): LinearLayout {
-        val container = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+    private fun dialInfoText(msg: String, color: String = "#9A9A9A"): TextView =
+        TextView(this).apply {
+            text = msg
+            setTextColor(Color.parseColor(color))
+            textSize = 12f
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+        }
+
+    /** Reloads the "Recent calls" list (search filter applied). Safe to call any time. */
+    private fun refreshRecentCalls() {
+        val container = dialRecentContainer ?: return
+        container.removeAllViews()
         try {
             if (ContextCompat.checkSelfPermission(
                     this, Manifest.permission.READ_CALL_LOG
                 ) != PackageManager.PERMISSION_GRANTED
             ) {
-                container.addView(TextView(this).apply {
-                    text =
-                        "Call log permission not granted.\nAdd READ_CALL_LOG permission and grant at runtime."
-                    setTextColor(Color.parseColor("#888888"))
-                    textSize = 12f
-                    setPadding(0, dp(4), 0, dp(4))
+                container.addView(dialInfoText("Allow call log access to see your recent calls."))
+                container.addView(Button(this).apply {
+                    text = "Allow"
+                    isAllCaps = false
+                    textSize = 13f
+                    setTextColor(Color.BLACK)
+                    minHeight = 0
+                    minimumHeight = 0
+                    stateListAnimator = null
+                    background = smsRound(W11.ACCENT, 6)
+                    setPadding(dp(18), 0, dp(18), 0)
+                    layoutParams = LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.WRAP_CONTENT, dp(34)
+                    ).apply { setMargins(dp(12), dp(2), 0, dp(8)) }
+                    setOnClickListener {
+                        ActivityCompat.requestPermissions(
+                            this@MainActivity,
+                            arrayOf(Manifest.permission.READ_CALL_LOG), REQ_CALL_LOG
+                        )
+                    }
                 })
-                return container
+                return
             }
+            val q = dialRecentSearch?.text?.toString()?.trim()?.lowercase() ?: ""
             val cursor = contentResolver.query(
                 android.provider.CallLog.Calls.CONTENT_URI,
                 arrayOf(
@@ -1239,40 +1474,54 @@ class MainActivity : AppCompatActivity() {
                 val nameIdx = it.getColumnIndex(android.provider.CallLog.Calls.CACHED_NAME)
                 val typeIdx = it.getColumnIndex(android.provider.CallLog.Calls.TYPE)
                 val dateIdx = it.getColumnIndex(android.provider.CallLog.Calls.DATE)
-                while (it.moveToNext() && count < 20) {
-                    val num = if (numIdx >= 0) it.getString(numIdx) else "?"
+                while (it.moveToNext() && count < 30) {
+                    val num = (if (numIdx >= 0) it.getString(numIdx) else null) ?: "?"
                     val name = if (nameIdx >= 0) it.getString(nameIdx) ?: "" else ""
                     val type = if (typeIdx >= 0) it.getInt(typeIdx) else 0
                     val date = if (dateIdx >= 0) it.getLong(dateIdx) else 0L
-                    val typeIcon = when (type) {
-                        android.provider.CallLog.Calls.INCOMING_TYPE -> "📲"
-                        android.provider.CallLog.Calls.OUTGOING_TYPE -> "📞"
-                        android.provider.CallLog.Calls.MISSED_TYPE -> "📵"
-                        else -> "📋"
-                    }
-                    val displayName = if (name.isNotEmpty()) name else num ?: "Unknown"
+                    if (q.isNotEmpty() &&
+                        !name.lowercase().contains(q) && !num.contains(q)
+                    ) continue
+                    val displayName = if (name.isNotEmpty()) name else num
                     val timeStr =
                         if (date > 0) DateUtils.getRelativeTimeSpanString(
                             date, System.currentTimeMillis(), DateUtils.MINUTE_IN_MILLIS
                         ).toString() else ""
+                    val (dirIcon, dirColor) = when (type) {
+                        android.provider.CallLog.Calls.INCOMING_TYPE ->
+                            VectorIconView.CALL_IN to Color.parseColor("#6CCB5F")
+                        android.provider.CallLog.Calls.OUTGOING_TYPE ->
+                            VectorIconView.CALL_OUT to Color.parseColor("#4CC2FF")
+                        android.provider.CallLog.Calls.MISSED_TYPE ->
+                            VectorIconView.CALL_MISSED to Color.parseColor("#FF6B6B")
+                        else -> VectorIconView.CALL_OUT to Color.parseColor("#9A9A9A")
+                    }
+
                     val row = LinearLayout(this).apply {
                         orientation = LinearLayout.HORIZONTAL
                         gravity = Gravity.CENTER_VERTICAL
-                        setBackgroundColor(Color.parseColor("#1E1E1E"))
-                        setPadding(dp(10), dp(10), dp(10), dp(10))
+                        setPadding(dp(12), dp(8), dp(10), dp(8))
                         layoutParams = LinearLayout.LayoutParams(
                             ViewGroup.LayoutParams.MATCH_PARENT,
                             ViewGroup.LayoutParams.WRAP_CONTENT
-                        ).apply { setMargins(0, dp(2), 0, dp(2)) }
-                    }
-                    val iconView = TextView(this).apply {
-                        text = typeIcon
-                        textSize = 20f
-                        gravity = Gravity.CENTER
-                        layoutParams = LinearLayout.LayoutParams(dp(36), dp(36)).apply {
-                            setMargins(0, 0, dp(10), 0)
+                        )
+                        isClickable = true
+                        setOnClickListener { dialSetNumber(num) }
+                        setOnTouchListener { v, ev ->
+                            when (ev.action) {
+                                android.view.MotionEvent.ACTION_DOWN ->
+                                    v.setBackgroundColor(W11.ITEM_ACTIVE_BG)
+                                android.view.MotionEvent.ACTION_UP,
+                                android.view.MotionEvent.ACTION_CANCEL ->
+                                    v.setBackgroundColor(Color.TRANSPARENT)
+                            }
+                            false
                         }
                     }
+                    val avatar = smsAvatar(displayName, 38)
+                    (avatar.layoutParams as LinearLayout.LayoutParams).rightMargin = dp(10)
+                    row.addView(avatar)
+
                     val textBlock = LinearLayout(this).apply {
                         orientation = LinearLayout.VERTICAL
                         layoutParams = LinearLayout.LayoutParams(
@@ -1281,74 +1530,57 @@ class MainActivity : AppCompatActivity() {
                     }
                     textBlock.addView(TextView(this).apply {
                         text = displayName
-                        setTextColor(Color.WHITE)
+                        setTextColor(if (type == android.provider.CallLog.Calls.MISSED_TYPE)
+                            Color.parseColor("#FF6B6B") else Color.WHITE)
                         textSize = 14f
+                        maxLines = 1
+                        ellipsize = android.text.TextUtils.TruncateAt.END
                     })
-                    textBlock.addView(TextView(this).apply {
-                        text = "$num  ·  $timeStr"
-                        setTextColor(Color.parseColor("#888888"))
-                        textSize = 11f
-                    })
-                    val callBackBtn = Button(this).apply {
-                        text = "📞"
-                        textSize = 18f
-                        setTextColor(Color.WHITE)
-                        setBackgroundColor(Color.parseColor("#4CAF50"))
-                        layoutParams = LinearLayout.LayoutParams(dp(46), dp(46))
-                        setPadding(0, 0, 0, 0)
-                        setOnClickListener {
-                            dialInput?.setText(num)
-                            makeCall()
-                        }
+                    val sub = LinearLayout(this).apply {
+                        orientation = LinearLayout.HORIZONTAL
+                        gravity = Gravity.CENTER_VERTICAL
                     }
-                    row.addView(iconView)
+                    val di = VectorIconView(this, dirIcon)
+                    di.setIconColor(dirColor)
+                    di.layoutParams = LinearLayout.LayoutParams(dp(12), dp(12)).apply {
+                        rightMargin = dp(4)
+                    }
+                    sub.addView(di)
+                    sub.addView(TextView(this).apply {
+                        text = if (name.isNotEmpty()) "$num  ·  $timeStr" else timeStr
+                        setTextColor(Color.parseColor("#9A9A9A"))
+                        textSize = 11f
+                        maxLines = 1
+                        ellipsize = android.text.TextUtils.TruncateAt.END
+                    })
+                    textBlock.addView(sub)
                     row.addView(textBlock)
-                    row.addView(callBackBtn)
+
+                    row.addView(smsIconButton(
+                        VectorIconView.PHONE, 36, Color.WHITE, Color.parseColor("#2E9E43")
+                    ) {
+                        dialSetNumber(num)
+                        makeCall()
+                    })
                     container.addView(row)
                     count++
                 }
             }
             if (count == 0) {
-                container.addView(TextView(this).apply {
-                    text = "No recent calls"
-                    setTextColor(Color.parseColor("#666666"))
-                    textSize = 13f
-                })
+                container.addView(dialInfoText(
+                    if (q.isEmpty()) "No recent calls" else "No matching calls", "#7A7A7A"
+                ))
             }
         } catch (e: SecurityException) {
-            container.addView(TextView(this).apply {
-                text = "Call log access denied"
-                setTextColor(Color.parseColor("#888888"))
-                textSize = 12f
-            })
+            container.addView(dialInfoText("Call log access denied"))
         } catch (e: Exception) {
-            container.addView(TextView(this).apply {
-                text = "Call log error: ${e.message}"
-                setTextColor(Color.parseColor("#888888"))
-                textSize = 12f
-            })
+            container.addView(dialInfoText("Call log error: ${e.message}"))
         }
-        return container
     }
 
     // =====================================================================
-    // ██████████  SMS SECTION  ██████████
+    // SMS SECTION  (UI lives in SmsUi.kt; only shared helpers stay here)
     // =====================================================================
-
-    private var smsListContainer: LinearLayout? = null
-    private var smsSearchEdit: EditText? = null
-
-    // PC-style two-pane state (list on the left, thread on the right)
-    private var smsListPane: LinearLayout? = null
-    private var smsThreadPane: LinearLayout? = null
-    private var smsThreadPlaceholder: LinearLayout? = null
-    private var smsThreadContent: LinearLayout? = null
-    private var smsCurrentAddress: String? = null
-    private var smsCurrentName: String = ""
-
-    /** Wide screens show list + thread side by side (PC layout); narrow ones switch between them. */
-    private val smsWide: Boolean
-        get() = resources.configuration.screenWidthDp >= 560
 
     // ── Small UI helpers (vector icons only, Win11 look) ─────────────────
     private fun smsRound(color: Int, radiusDp: Int): android.graphics.drawable.GradientDrawable =
@@ -1402,692 +1634,6 @@ class MainActivity : AppCompatActivity() {
             box.addView(ic)
         }
         return box
-    }
-
-    private fun createSmsView(): LinearLayout {
-        val a = this
-        val mp = ViewGroup.LayoutParams.MATCH_PARENT
-        val wc = ViewGroup.LayoutParams.WRAP_CONTENT
-
-        val root = LinearLayout(a)
-        root.orientation = LinearLayout.VERTICAL
-        root.setBackgroundColor(Color.parseColor("#202020"))
-        root.layoutParams = ViewGroup.LayoutParams(mp, mp)
-
-        // ── Window title bar ──
-        val titleBar = LinearLayout(a)
-        titleBar.orientation = LinearLayout.HORIZONTAL
-        titleBar.gravity = Gravity.CENTER_VERTICAL
-        titleBar.setPadding(dp(14), 0, dp(14), 0)
-        titleBar.layoutParams = LinearLayout.LayoutParams(mp, dp(40))
-        val titleIcon = VectorIconView(a, VectorIconView.MESSAGES)
-        titleIcon.layoutParams = LinearLayout.LayoutParams(dp(16), dp(16))
-        titleBar.addView(titleIcon)
-        val titleText = TextView(a)
-        titleText.text = "Messages"
-        titleText.setTextColor(W11.TEXT)
-        titleText.textSize = 12f
-        titleText.setPadding(dp(10), 0, 0, 0)
-        titleBar.addView(titleText)
-        root.addView(titleBar)
-
-        val body = LinearLayout(a)
-        body.orientation = LinearLayout.HORIZONTAL
-        body.layoutParams = LinearLayout.LayoutParams(mp, 0, 1f)
-
-        // ── LEFT PANE: search + new message + conversation list ──
-        val listPane = LinearLayout(a)
-        listPane.orientation = LinearLayout.VERTICAL
-        listPane.setBackgroundColor(Color.parseColor("#272727"))
-        listPane.layoutParams =
-            if (smsWide) LinearLayout.LayoutParams(dp(320), mp)
-            else LinearLayout.LayoutParams(0, mp, 1f)
-
-        val toolbar = LinearLayout(a)
-        toolbar.orientation = LinearLayout.HORIZONTAL
-        toolbar.gravity = Gravity.CENTER_VERTICAL
-        toolbar.setPadding(dp(10), dp(8), dp(10), dp(8))
-        toolbar.layoutParams = LinearLayout.LayoutParams(mp, wc)
-
-        val searchBox = LinearLayout(a)
-        searchBox.orientation = LinearLayout.HORIZONTAL
-        searchBox.gravity = Gravity.CENTER_VERTICAL
-        searchBox.background = smsRound(Color.parseColor("#333333"), 6)
-        searchBox.setPadding(dp(10), 0, dp(10), 0)
-        searchBox.layoutParams = LinearLayout.LayoutParams(0, dp(36), 1f)
-        val searchIcon = VectorIconView(a, VectorIconView.SEARCH)
-        searchIcon.setIconColor(W11.TEXT_DIM)
-        searchIcon.layoutParams = LinearLayout.LayoutParams(dp(14), dp(14))
-        searchBox.addView(searchIcon)
-        smsSearchEdit = EditText(a).apply {
-            hint = "Search messages"
-            textSize = 13f
-            maxLines = 1
-            setSingleLine(true)
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.parseColor("#80FFFFFF"))
-            setBackgroundColor(Color.TRANSPARENT)
-            setPadding(dp(8), 0, 0, 0)
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
-            addTextChangedListener(object : android.text.TextWatcher {
-                override fun afterTextChanged(s: android.text.Editable?) { refreshSmsView() }
-                override fun beforeTextChanged(s: CharSequence?, start: Int, count: Int, after: Int) {}
-                override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
-            })
-        }
-        searchBox.addView(smsSearchEdit)
-        toolbar.addView(searchBox)
-
-        val composeBtn = smsIconButton(
-            VectorIconView.EDIT, 36, Color.BLACK, W11.ACCENT
-        ) { showComposeSmsDialog(null, "") }
-        (composeBtn.layoutParams as LinearLayout.LayoutParams).leftMargin = dp(8)
-        toolbar.addView(composeBtn)
-        listPane.addView(toolbar)
-
-        val scroll = ScrollView(a)
-        scroll.layoutParams = LinearLayout.LayoutParams(mp, 0, 1f)
-        scroll.isVerticalScrollBarEnabled = false
-        smsListContainer = LinearLayout(a).apply {
-            orientation = LinearLayout.VERTICAL
-        }
-        scroll.addView(smsListContainer)
-        listPane.addView(scroll)
-        body.addView(listPane)
-        smsListPane = listPane
-
-        if (smsWide) {
-            val divider = View(a)
-            divider.setBackgroundColor(W11.DIVIDER)
-            divider.layoutParams = LinearLayout.LayoutParams(dp(1), mp)
-            body.addView(divider)
-        }
-
-        // ── RIGHT PANE: placeholder (wide only) or the open conversation ──
-        val threadPane = LinearLayout(a)
-        threadPane.orientation = LinearLayout.VERTICAL
-        threadPane.setBackgroundColor(Color.parseColor("#1F1F1F"))
-        threadPane.layoutParams = LinearLayout.LayoutParams(0, mp, 1f)
-
-        val placeholder = LinearLayout(a)
-        placeholder.orientation = LinearLayout.VERTICAL
-        placeholder.gravity = Gravity.CENTER
-        placeholder.layoutParams = LinearLayout.LayoutParams(mp, 0, 1f)
-        val phIcon = VectorIconView(a, VectorIconView.MESSAGES)
-        phIcon.setIconColor(Color.parseColor("#554CC2FF"))
-        phIcon.layoutParams = LinearLayout.LayoutParams(dp(56), dp(56))
-        placeholder.addView(phIcon)
-        val phText = TextView(a)
-        phText.text = "Select a conversation"
-        phText.setTextColor(W11.TEXT_DIM)
-        phText.textSize = 14f
-        phText.gravity = Gravity.CENTER
-        phText.setPadding(0, dp(12), 0, 0)
-        placeholder.addView(phText)
-        placeholder.visibility = if (smsWide) View.VISIBLE else View.GONE
-        threadPane.addView(placeholder)
-
-        val content = LinearLayout(a)
-        content.orientation = LinearLayout.VERTICAL
-        content.layoutParams = LinearLayout.LayoutParams(mp, 0, 1f)
-        content.visibility = View.GONE
-        threadPane.addView(content)
-
-        threadPane.visibility = if (smsWide) View.VISIBLE else View.GONE
-        body.addView(threadPane)
-        smsThreadPane = threadPane
-        smsThreadPlaceholder = placeholder
-        smsThreadContent = content
-
-        root.addView(body)
-        return root
-    }
-
-    private fun smsShowThreadPane() {
-        smsThreadPlaceholder?.visibility = View.GONE
-        smsThreadContent?.visibility = View.VISIBLE
-        smsThreadPane?.visibility = View.VISIBLE
-        if (!smsWide) smsListPane?.visibility = View.GONE
-    }
-
-    /** Closes the open conversation (narrow: back to the list; wide: show the placeholder). */
-    private fun smsCloseThread() {
-        smsCurrentAddress = null
-        smsThreadContent?.visibility = View.GONE
-        if (smsWide) {
-            smsThreadPlaceholder?.visibility = View.VISIBLE
-        } else {
-            smsThreadPane?.visibility = View.GONE
-            smsListPane?.visibility = View.VISIBLE
-        }
-        refreshSmsView()
-    }
-
-    private fun refreshSmsView() {
-        val container = smsListContainer ?: return
-        container.removeAllViews()
-
-        if (ContextCompat.checkSelfPermission(
-                this, PERM_SMS_R
-            ) != PackageManager.PERMISSION_GRANTED
-        ) {
-            ActivityCompat.requestPermissions(
-                this, arrayOf(PERM_SMS_R, PERM_SMS_S, PERM_SMS_R2), REQ_SMS
-            )
-            container.addView(TextView(this).apply {
-                text = "SMS permission required.\nTap to grant."
-                setTextColor(Color.WHITE)
-                textSize = 14f
-                setPadding(dp(20), dp(20), dp(20), dp(20))
-                gravity = Gravity.CENTER
-                setOnClickListener {
-                    ActivityCompat.requestPermissions(
-                        this@MainActivity,
-                        arrayOf(PERM_SMS_R, PERM_SMS_S, PERM_SMS_R2),
-                        REQ_SMS
-                    )
-                }
-            })
-            return
-        }
-
-        val query = smsSearchEdit?.text?.toString()?.lowercase() ?: ""
-        val conversations = mutableMapOf<String, SmsConversation>()
-
-        try {
-            val uri = Uri.parse("content://sms/")
-            val cursor = contentResolver.query(
-                uri,
-                arrayOf("_id", "address", "body", "date", "type", "read", "thread_id"),
-                null, null, "date DESC"
-            )
-            cursor?.use {
-                val addrIdx = it.getColumnIndex("address")
-                val bodyIdx = it.getColumnIndex("body")
-                val dateIdx = it.getColumnIndex("date")
-                val typeIdx = it.getColumnIndex("type")
-                val readIdx = it.getColumnIndex("read")
-                while (it.moveToNext()) {
-                    val addr =
-                        if (addrIdx >= 0) it.getString(addrIdx) ?: "Unknown" else "Unknown"
-                    val body = if (bodyIdx >= 0) it.getString(bodyIdx) ?: "" else ""
-                    val date = if (dateIdx >= 0) it.getLong(dateIdx) else 0L
-                    val type = if (typeIdx >= 0) it.getInt(typeIdx) else 1
-                    val isRead = if (readIdx >= 0) it.getInt(readIdx) == 1 else true
-
-                    if (query.isNotEmpty() && !addr.contains(query) && !body.lowercase()
-                            .contains(query)
-                    ) continue
-
-                    if (!conversations.containsKey(addr)) {
-                        conversations[addr] =
-                            SmsConversation(addr, body, date, type, if (isRead) 0 else 1)
-                    } else if (!isRead) {
-                        conversations[addr]!!.unreadCount++
-                    }
-                }
-            }
-        } catch (e: Exception) {
-            container.addView(TextView(this).apply {
-                text = "SMS load error: ${e.message}"
-                setTextColor(Color.parseColor("#FF4444"))
-                textSize = 12f
-                setPadding(dp(16), dp(16), dp(16), dp(16))
-            })
-            return
-        }
-
-        if (conversations.isEmpty()) {
-            container.addView(TextView(this).apply {
-                text =
-                    if (query.isEmpty()) "No messages found" else "No results for \"$query\""
-                setTextColor(W11.TEXT_DIM)
-                textSize = 14f
-                gravity = Gravity.CENTER
-                setPadding(dp(20), dp(40), dp(20), dp(40))
-            })
-            return
-        }
-
-        for ((_, conv) in conversations.entries.take(200)) {
-            container.addView(buildSmsRow(conv))
-        }
-    }
-
-    data class SmsConversation(
-        val address: String,
-        val snippet: String,
-        val date: Long,
-        val type: Int,
-        var unreadCount: Int
-    )
-
-    private fun buildSmsRow(conv: SmsConversation): View {
-        val a = this
-        val mp = ViewGroup.LayoutParams.MATCH_PARENT
-        val wc = ViewGroup.LayoutParams.WRAP_CONTENT
-        val isSentLast = conv.type == Telephony.TextBasedSmsColumns.MESSAGE_TYPE_SENT
-        val timeStr =
-            if (conv.date > 0) DateUtils.getRelativeTimeSpanString(
-                conv.date, System.currentTimeMillis(), DateUtils.MINUTE_IN_MILLIS
-            ).toString() else ""
-        val displayAddr = getContactName(conv.address)
-        val selected = smsWide && conv.address == smsCurrentAddress
-        val unread = conv.unreadCount > 0
-
-        val row = LinearLayout(a)
-        row.orientation = LinearLayout.HORIZONTAL
-        row.gravity = Gravity.CENTER_VERTICAL
-        row.setPadding(dp(6), dp(10), dp(10), dp(10))
-        row.background = smsRound(if (selected) W11.ITEM_ACTIVE_BG else Color.TRANSPARENT, 6)
-        row.layoutParams = LinearLayout.LayoutParams(mp, wc).apply {
-            setMargins(dp(6), dp(1), dp(6), dp(1))
-        }
-
-        // accent selection indicator (Win11 style)
-        val indicator = View(a)
-        indicator.background = smsRound(if (selected) W11.ACCENT else Color.TRANSPARENT, 2)
-        indicator.layoutParams = LinearLayout.LayoutParams(dp(3), dp(18)).apply {
-            setMargins(0, 0, dp(7), 0)
-        }
-        row.addView(indicator)
-
-        val avatar = smsAvatar(displayAddr, 40)
-        (avatar.layoutParams as LinearLayout.LayoutParams).rightMargin = dp(12)
-        row.addView(avatar)
-
-        val textBlock = LinearLayout(a)
-        textBlock.orientation = LinearLayout.VERTICAL
-        textBlock.layoutParams = LinearLayout.LayoutParams(0, wc, 1f)
-        val nameView = TextView(a)
-        nameView.text = displayAddr
-        nameView.setTextColor(W11.TEXT)
-        nameView.textSize = 14f
-        nameView.maxLines = 1
-        nameView.ellipsize = android.text.TextUtils.TruncateAt.END
-        if (unread) nameView.typeface = Typeface.DEFAULT_BOLD
-        textBlock.addView(nameView)
-        val snippetView = TextView(a)
-        val snip = conv.snippet.replace("\n", " ")
-        snippetView.text = (if (isSentLast) "You: " else "") + snip
-        snippetView.setTextColor(if (unread) W11.TEXT else W11.TEXT_DIM)
-        snippetView.textSize = 12f
-        snippetView.maxLines = 1
-        snippetView.ellipsize = android.text.TextUtils.TruncateAt.END
-        textBlock.addView(snippetView)
-        row.addView(textBlock)
-
-        val right = LinearLayout(a)
-        right.orientation = LinearLayout.VERTICAL
-        right.gravity = Gravity.END
-        right.setPadding(dp(8), 0, 0, 0)
-        right.layoutParams = LinearLayout.LayoutParams(wc, wc)
-        val timeView = TextView(a)
-        timeView.text = timeStr
-        timeView.setTextColor(W11.TEXT_DIM)
-        timeView.textSize = 11f
-        right.addView(timeView)
-        if (unread) {
-            val badge = TextView(a)
-            badge.text = conv.unreadCount.toString()
-            badge.textSize = 10f
-            badge.typeface = Typeface.DEFAULT_BOLD
-            badge.gravity = Gravity.CENTER
-            badge.setTextColor(Color.BLACK)
-            badge.background = smsRound(W11.ACCENT, 9)
-            badge.minWidth = dp(18)
-            badge.setPadding(dp(5), dp(1), dp(5), dp(1))
-            badge.layoutParams = LinearLayout.LayoutParams(wc, wc).apply { topMargin = dp(4) }
-            right.addView(badge)
-        }
-        row.addView(right)
-
-        row.setOnClickListener { openSmsThread(conv.address, displayAddr) }
-        row.setOnLongClickListener {
-            val menu = PopupMenu(a, row)
-            menu.menu.add(0, 1, 0, "Call")
-            menu.menu.add(0, 2, 1, "Reply")
-            menu.menu.add(0, 3, 2, "Delete conversation")
-            menu.setOnMenuItemClickListener { item ->
-                when (item.itemId) {
-                    1 -> {
-                        dialInput?.setText(conv.address)
-                        switchToSection("dialer")
-                    }
-                    2 -> showComposeSmsDialog(conv.address, "")
-                    3 -> deleteSmsThread(conv.address)
-                }
-                true
-            }
-            menu.show()
-            true
-        }
-        return row
-    }
-
-    private fun getContactName(address: String): String {
-        if (ContextCompat.checkSelfPermission(
-                this, PERM_CONTACTS
-            ) != PackageManager.PERMISSION_GRANTED
-        ) return address
-        return try {
-            val uri = Uri.withAppendedPath(
-                ContactsContract.PhoneLookup.CONTENT_FILTER_URI, Uri.encode(address)
-            )
-            val cursor = contentResolver.query(
-                uri, arrayOf(ContactsContract.PhoneLookup.DISPLAY_NAME), null, null, null
-            )
-            cursor?.use { if (it.moveToFirst()) it.getString(0) else address } ?: address
-        } catch (e: Exception) { address }
-    }
-
-    private fun smsBubbleRow(msg: SmsMessage, maxW: Int): LinearLayout {
-        val a = this
-        val mp = ViewGroup.LayoutParams.MATCH_PARENT
-        val wc = ViewGroup.LayoutParams.WRAP_CONTENT
-        val isSent = msg.type == Telephony.TextBasedSmsColumns.MESSAGE_TYPE_SENT
-        val row = LinearLayout(a)
-        row.orientation = LinearLayout.HORIZONTAL
-        row.gravity = if (isSent) Gravity.END else Gravity.START
-        row.layoutParams = LinearLayout.LayoutParams(mp, wc).apply { setMargins(0, dp(3), 0, dp(3)) }
-
-        val bubble = LinearLayout(a)
-        bubble.orientation = LinearLayout.VERTICAL
-        bubble.background =
-            smsRound(if (isSent) Color.parseColor("#0A5CAD") else Color.parseColor("#3A3A3A"), 8)
-        bubble.setPadding(dp(12), dp(8), dp(12), dp(6))
-
-        val bodyView = TextView(a)
-        bodyView.text = msg.body
-        bodyView.setTextColor(Color.WHITE)
-        bodyView.textSize = 14f
-        bodyView.maxWidth = maxW
-        bubble.addView(bodyView)
-
-        val timeView = TextView(a)
-        timeView.text = if (msg.date > 0)
-            SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(msg.date)) else ""
-        timeView.setTextColor(Color.parseColor("#B3FFFFFF"))
-        timeView.textSize = 10f
-        timeView.layoutParams = LinearLayout.LayoutParams(wc, wc).apply {
-            gravity = Gravity.END
-            topMargin = dp(2)
-        }
-        bubble.addView(timeView)
-        row.addView(bubble)
-        return row
-    }
-
-    private fun openSmsThread(address: String, displayName: String) {
-        val messages = mutableListOf<SmsMessage>()
-        try {
-            val cursor = contentResolver.query(
-                Uri.parse("content://sms/"),
-                arrayOf("_id", "body", "date", "type"),
-                "address = ?", arrayOf(address),
-                "date ASC"
-            )
-            cursor?.use {
-                val bodyIdx = it.getColumnIndex("body")
-                val dateIdx = it.getColumnIndex("date")
-                val typeIdx = it.getColumnIndex("type")
-                while (it.moveToNext()) {
-                    val body = if (bodyIdx >= 0) it.getString(bodyIdx) ?: "" else ""
-                    val date = if (dateIdx >= 0) it.getLong(dateIdx) else 0L
-                    val type = if (typeIdx >= 0) it.getInt(typeIdx) else 1
-                    messages.add(SmsMessage(body, date, type))
-                }
-            }
-        } catch (e: Exception) {
-            Toast.makeText(this, "SMS thread error: ${e.message}", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        val content = smsThreadContent ?: return
-        val a = this
-        val mp = ViewGroup.LayoutParams.MATCH_PARENT
-        val wc = ViewGroup.LayoutParams.WRAP_CONTENT
-        smsCurrentAddress = address
-        smsCurrentName = displayName
-        content.removeAllViews()
-
-        // ── Header: [back] avatar  name / number   call  delete ──
-        val header = LinearLayout(a)
-        header.orientation = LinearLayout.HORIZONTAL
-        header.gravity = Gravity.CENTER_VERTICAL
-        header.setBackgroundColor(Color.parseColor("#262626"))
-        header.setPadding(dp(8), dp(8), dp(12), dp(8))
-        header.layoutParams = LinearLayout.LayoutParams(mp, wc)
-        if (!smsWide) {
-            header.addView(smsIconButton(VectorIconView.BACK, 40, Color.WHITE, null) {
-                smsCloseThread()
-            })
-        } else {
-            header.setPadding(dp(16), dp(8), dp(12), dp(8))
-        }
-        val avatar = smsAvatar(displayName, 36)
-        (avatar.layoutParams as LinearLayout.LayoutParams).setMargins(dp(4), 0, dp(10), 0)
-        header.addView(avatar)
-
-        val nameBlock = LinearLayout(a)
-        nameBlock.orientation = LinearLayout.VERTICAL
-        nameBlock.layoutParams = LinearLayout.LayoutParams(0, wc, 1f)
-        val headerName = TextView(a)
-        headerName.text = displayName
-        headerName.textSize = 15f
-        headerName.typeface = Typeface.DEFAULT_BOLD
-        headerName.setTextColor(Color.WHITE)
-        headerName.maxLines = 1
-        headerName.ellipsize = android.text.TextUtils.TruncateAt.END
-        nameBlock.addView(headerName)
-        val headerSub = TextView(a)
-        headerSub.text =
-            (if (displayName != address) "$address  -  " else "") + "${messages.size} messages"
-        headerSub.textSize = 11f
-        headerSub.setTextColor(W11.TEXT_DIM)
-        nameBlock.addView(headerSub)
-        header.addView(nameBlock)
-
-        header.addView(smsIconButton(VectorIconView.PHONE, 40, Color.parseColor("#6CCB5F"), null) {
-            dialInput?.setText(address)
-            switchToSection("dialer")
-        })
-        header.addView(smsIconButton(VectorIconView.DELETE, 40, Color.parseColor("#FF99A4"), null) {
-            deleteSmsThread(address)
-        })
-        content.addView(header)
-
-        val divider = View(a)
-        divider.setBackgroundColor(W11.DIVIDER)
-        divider.layoutParams = LinearLayout.LayoutParams(mp, dp(1))
-        content.addView(divider)
-
-        // ── Messages (grouped by day) ──
-        val msgScroll = ScrollView(a)
-        msgScroll.layoutParams = LinearLayout.LayoutParams(mp, 0, 1f)
-        val msgContainer = LinearLayout(a)
-        msgContainer.orientation = LinearLayout.VERTICAL
-        msgContainer.setPadding(dp(14), dp(10), dp(14), dp(10))
-        val maxW = (resources.displayMetrics.widthPixels * (if (smsWide) 0.4f else 0.68f)).toInt()
-        val dayFmt = SimpleDateFormat("d MMMM yyyy", Locale.getDefault())
-        var lastDay = ""
-        for (msg in messages) {
-            if (msg.date > 0) {
-                val day = dayFmt.format(Date(msg.date))
-                if (day != lastDay) {
-                    lastDay = day
-                    val chip = TextView(a)
-                    chip.text = day
-                    chip.setTextColor(W11.TEXT_DIM)
-                    chip.textSize = 11f
-                    chip.gravity = Gravity.CENTER
-                    chip.setPadding(0, dp(8), 0, dp(6))
-                    chip.layoutParams = LinearLayout.LayoutParams(mp, wc)
-                    msgContainer.addView(chip)
-                }
-            }
-            msgContainer.addView(smsBubbleRow(msg, maxW))
-        }
-        if (messages.isEmpty()) {
-            val empty = TextView(a)
-            empty.text = "No messages"
-            empty.setTextColor(W11.TEXT_DIM)
-            empty.textSize = 14f
-            empty.gravity = Gravity.CENTER
-            empty.setPadding(dp(20), dp(40), dp(20), dp(40))
-            msgContainer.addView(empty)
-        }
-        msgScroll.addView(msgContainer)
-        content.addView(msgScroll)
-        msgScroll.post { msgScroll.fullScroll(View.FOCUS_DOWN) }
-
-        // ── Composer ──
-        val replyBar = LinearLayout(a)
-        replyBar.orientation = LinearLayout.HORIZONTAL
-        replyBar.gravity = Gravity.CENTER_VERTICAL
-        replyBar.setBackgroundColor(Color.parseColor("#262626"))
-        replyBar.setPadding(dp(10), dp(8), dp(10), dp(8))
-        replyBar.layoutParams = LinearLayout.LayoutParams(mp, wc)
-        val inputBox = LinearLayout(a)
-        inputBox.orientation = LinearLayout.HORIZONTAL
-        inputBox.gravity = Gravity.CENTER_VERTICAL
-        inputBox.background = smsRound(Color.parseColor("#333333"), 8)
-        inputBox.setPadding(dp(12), dp(2), dp(12), dp(2))
-        inputBox.layoutParams = LinearLayout.LayoutParams(0, wc, 1f)
-        val replyEdit = EditText(a)
-        replyEdit.hint = "Type a message"
-        replyEdit.textSize = 14f
-        replyEdit.setTextColor(Color.WHITE)
-        replyEdit.setHintTextColor(Color.parseColor("#80FFFFFF"))
-        replyEdit.setBackgroundColor(Color.TRANSPARENT)
-        replyEdit.maxLines = 4
-        replyEdit.setPadding(0, dp(8), 0, dp(8))
-        replyEdit.layoutParams = LinearLayout.LayoutParams(mp, wc)
-        inputBox.addView(replyEdit)
-        replyBar.addView(inputBox)
-        val sendBtn = smsIconButton(VectorIconView.SEND, 42, Color.BLACK, W11.ACCENT) {
-            val text = replyEdit.text.toString().trim()
-            if (text.isNotEmpty()) {
-                sendSms(address, text)
-                replyEdit.setText("")
-                openSmsThread(address, displayName)
-            }
-        }
-        (sendBtn.layoutParams as LinearLayout.LayoutParams).leftMargin = dp(8)
-        replyBar.addView(sendBtn)
-        content.addView(replyBar)
-
-        smsShowThreadPane()
-        if (smsWide) refreshSmsView() // update selected highlight in the list
-    }
-
-    data class SmsMessage(val body: String, val date: Long, val type: Int)
-
-    private fun showComposeSmsDialog(preFilledAddress: String?, preFilledBody: String) {
-        val dialogView = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.parseColor("#1E1E1E"))
-            setPadding(dp(16), dp(16), dp(16), dp(16))
-        }
-        dialogView.addView(TextView(this).apply {
-            text = "To:"
-            setTextColor(Color.parseColor("#AAAAAA"))
-            textSize = 13f
-        })
-        val toEdit = EditText(this).apply {
-            hint = "Phone number"
-            textSize = 14f
-            setText(preFilledAddress ?: "")
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.GRAY)
-            setBackgroundColor(Color.parseColor("#2A2A2A"))
-            setPadding(dp(10), dp(8), dp(10), dp(8))
-            inputType = android.text.InputType.TYPE_CLASS_PHONE
-        }
-        dialogView.addView(toEdit)
-        dialogView.addView(View(this).apply {
-            layoutParams =
-                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(8))
-        })
-        dialogView.addView(TextView(this).apply {
-            text = "Message:"
-            setTextColor(Color.parseColor("#AAAAAA"))
-            textSize = 13f
-        })
-        val msgEdit = EditText(this).apply {
-            hint = "Type message here…"
-            textSize = 14f
-            setText(preFilledBody)
-            setTextColor(Color.WHITE)
-            setHintTextColor(Color.GRAY)
-            setBackgroundColor(Color.parseColor("#2A2A2A"))
-            setPadding(dp(10), dp(8), dp(10), dp(8))
-            minLines = 3
-            maxLines = 6
-            gravity = Gravity.TOP
-        }
-        dialogView.addView(msgEdit)
-
-        AlertDialog.Builder(this)
-            .setTitle("New message")
-            .setView(dialogView)
-            .setPositiveButton("Send") { _, _ ->
-                val to = toEdit.text.toString().trim()
-                val msg = msgEdit.text.toString().trim()
-                if (to.isEmpty() || msg.isEmpty()) {
-                    Toast.makeText(this, "Number and message required", Toast.LENGTH_SHORT).show()
-                } else sendSms(to, msg)
-            }
-            .setNegativeButton("Cancel", null)
-            .show()
-    }
-
-    private fun sendSms(address: String, body: String) {
-        if (ContextCompat.checkSelfPermission(
-                this, PERM_SMS_S
-            ) != PackageManager.PERMISSION_GRANTED
-        ) {
-            ActivityCompat.requestPermissions(
-                this, arrayOf(PERM_SMS_S, PERM_SMS_R), REQ_SMS
-            )
-            Toast.makeText(this, "SMS permission required", Toast.LENGTH_SHORT).show()
-            return
-        }
-        try {
-            val smsManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                this.getSystemService(SmsManager::class.java)
-            } else {
-                @Suppress("DEPRECATION")
-                SmsManager.getDefault()
-            }
-            val parts = smsManager.divideMessage(body)
-            if (parts.size == 1) smsManager.sendTextMessage(address, null, body, null, null)
-            else smsManager.sendMultipartTextMessage(address, null, parts, null, null)
-            Toast.makeText(this, "SMS sent to $address", Toast.LENGTH_SHORT).show()
-            if (activeSection == "sms") refreshSmsView()
-        } catch (e: Exception) {
-            Toast.makeText(this, "SMS failed: ${e.message}", Toast.LENGTH_LONG).show()
-        }
-    }
-
-    private fun deleteSmsThread(address: String) {
-        AlertDialog.Builder(this)
-            .setTitle("Delete conversation")
-            .setMessage("Delete all messages with $address?")
-            .setPositiveButton("Delete") { _, _ ->
-                try {
-                    val deleted = contentResolver.delete(
-                        Uri.parse("content://sms/"), "address = ?", arrayOf(address)
-                    )
-                    Toast.makeText(this, "Deleted $deleted message(s)", Toast.LENGTH_SHORT).show()
-                    if (smsCurrentAddress == address) smsCloseThread() else refreshSmsView()
-                } catch (e: Exception) {
-                    Toast.makeText(
-                        this, "Delete failed: ${e.message}", Toast.LENGTH_SHORT
-                    ).show()
-                }
-            }
-            .setNegativeButton("Cancel", null).show()
     }
 
     // =====================================================================
@@ -3909,7 +3455,7 @@ class MainActivity : AppCompatActivity() {
                     backToDesktop()
                 }
             }
-            activeSection == "sms" && !smsWide && smsCurrentAddress != null -> smsCloseThread()
+            activeSection == "sms" && ::smsUi.isInitialized && smsUi.handleBack() -> { /* closed the open chat */ }
             else -> backToDesktop()
         }
     }

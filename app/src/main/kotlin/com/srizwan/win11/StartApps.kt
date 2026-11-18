@@ -13,6 +13,7 @@ import androidx.core.graphics.PathParser
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import java.util.Locale
 import java.util.concurrent.Executors
 
 // =====================================================================
@@ -25,10 +26,13 @@ class AppEntry(
     val cls: String,
     val icon: Drawable,
     /** Non-null = built-in app that opens inside Win11 itself (e.g. "browser"). */
-    val section: String? = null
+    val section: String? = null,
+    /** >= 0 = a clone living in the virtual space with this id (opened through CloneEngine). */
+    val cloneUserId: Int = -1
 ) {
     val key: String get() = "$pkg/$cls"
     val isBuiltIn: Boolean get() = section != null
+    val isClone: Boolean get() = cloneUserId >= 0
 
     fun launchIntent(): Intent = Intent(Intent.ACTION_MAIN).apply {
         addCategory(Intent.CATEGORY_LAUNCHER)
@@ -82,6 +86,9 @@ class AppRepository(private val ctx: Context) {
     companion object {
         private const val KEY_PINNED = "pinned"
         private const val KEY_HIDDEN = "hidden"
+        /** Apps already hidden once by default (so unhiding them later is respected). */
+        private const val KEY_DEFAULT_HIDDEN_DONE = "default_hidden_done"
+        private const val CLONE_CLS_PREFIX = "clone."
         private const val DEFAULT_COUNT = 12
         private const val KEY_BROWSER_SEEDED = "builtin_browser_seeded"
         private const val BUILTIN_CLS_BROWSER = "builtin.browser"
@@ -139,8 +146,9 @@ class AppRepository(private val ctx: Context) {
             val list = try { query() } catch (e: Exception) { null }
             main.post {
                 if (list == null) return@post
-                val changed = list.map { it.key } != apps.map { it.key }
+                var changed = list.map { it.key } != apps.map { it.key }
                 apps = list
+                if (hideByDefault(list)) changed = true
                 if (!prefs.contains(KEY_PINNED)) {
                     pinnedKeys.clear()
                     pinnedKeys.addAll(defaultPins(list))
@@ -203,6 +211,49 @@ class AppRepository(private val ctx: Context) {
         }
     }
 
+    /** PalmPay is hidden by default (once). The user can unhide it later and it stays visible. */
+    private fun isPalmPay(e: AppEntry): Boolean {
+        if (e.isBuiltIn || e.isClone) return false
+        val pkgNorm = e.pkg.lowercase(Locale.ROOT)
+        val labelNorm = e.label.lowercase(Locale.ROOT).filter { it.isLetterOrDigit() }
+        return pkgNorm.contains("palmpay") || labelNorm == "palmpay"
+    }
+
+    /** Returns true if something got hidden now. */
+    private fun hideByDefault(list: List<AppEntry>): Boolean {
+        val done = (prefs.getString(KEY_DEFAULT_HIDDEN_DONE, null)
+            ?.split("\n")?.filter { it.isNotBlank() } ?: emptyList()).toMutableSet()
+        var any = false
+        var unpinned = false
+        for (e in list) {
+            if (!isPalmPay(e) || e.key in done) continue
+            done.add(e.key)
+            if (hiddenKeys.add(e.key)) any = true
+            if (pinnedKeys.remove(e.key)) unpinned = true
+        }
+        if (done.isNotEmpty()) {
+            prefs.edit().putString(KEY_DEFAULT_HIDDEN_DONE, done.joinToString("\n")).apply()
+        }
+        if (any) saveHidden()
+        // save() only when something really was unpinned: it would otherwise create the
+        // "pinned" pref too early and skip the first-run default pins.
+        if (unpinned) save()
+        return any
+    }
+
+    /** Clones made through the clone engine (bKash / Nagad / WhatsApp only). */
+    private fun cloneApps(): List<AppEntry> {
+        val items = try { CloneEngine.listClones() } catch (e: Throwable) { emptyList() }
+        return items.map {
+            val suffix = if (it.userId == 0) "(Clone)" else "(Clone ${it.userId + 1})"
+            AppEntry(
+                "${it.label} $suffix", it.packageName, "$CLONE_CLS_PREFIX${it.userId}",
+                it.icon ?: ctx.packageManager.defaultActivityIcon,
+                cloneUserId = it.userId
+            )
+        }
+    }
+
     private fun builtInApps(): List<AppEntry> = listOf(
         AppEntry(
             "Files", ctx.packageName, BUILTIN_CLS_FILES,
@@ -248,6 +299,7 @@ class AppRepository(private val ctx: Context) {
                 )
             }
             .plus(builtInApps())
+            .plus(cloneApps())
             .distinctBy { it.key }
             .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.label })
             .toList()
