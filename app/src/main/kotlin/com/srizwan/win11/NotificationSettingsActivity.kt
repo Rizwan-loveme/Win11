@@ -49,6 +49,12 @@ class NotificationSettingsActivity : AppCompatActivity() {
             window.navigationBarColor = Color.parseColor("#202020")
         } catch (e: Exception) { }
         setContentView(buildScreen())
+        try {
+            androidx.core.view.WindowCompat.getInsetsController(window, window.decorView).apply {
+                isAppearanceLightStatusBars = false
+                isAppearanceLightNavigationBars = false
+            }
+        } catch (e: Exception) { }
     }
 
     override fun onResume() {

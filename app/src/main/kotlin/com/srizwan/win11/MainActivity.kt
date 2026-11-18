@@ -50,6 +50,9 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowCompat
+import androidx.core.view.WindowInsetsCompat
 import java.io.File
 import java.io.FileOutputStream
 import java.io.InputStream
@@ -137,10 +140,8 @@ class MainActivity : AppCompatActivity() {
 
     // ── File manager ─────────────────────────────────────────────
     private lateinit var fileManagerView: LinearLayout
-    private lateinit var fileListView: ListView
+    private lateinit var explorerUi: ExplorerUi
     private var currentPath: File = Environment.getExternalStorageDirectory()
-    private lateinit var pathText: TextView
-    private lateinit var storageInfo: TextView
 
     // ── Browser ──────────────────────────────────────────────────
     private lateinit var browserView: LinearLayout
@@ -151,6 +152,15 @@ class MainActivity : AppCompatActivity() {
     private lateinit var urlBar: EditText
     private lateinit var progressBar: ProgressBar
     private lateinit var webContainer: FrameLayout
+    private lateinit var downloadsUi: DownloadsUi
+    private lateinit var downloadsView: LinearLayout
+    private lateinit var reloadBtn: TextView
+    private lateinit var backNavIcon: VectorIconView
+    private lateinit var fwdNavIcon: VectorIconView
+    private lateinit var desktopIcon: VectorIconView
+    private lateinit var dlBadge: TextView
+    private var isPageLoading = false
+    private val dlListener: () -> Unit = { updateDownloadBadge() }
 
     // ── Phone / SMS / Contacts / Flashlight ──────────────────────
     private lateinit var dialerView: LinearLayout
@@ -257,6 +267,7 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         try { supportActionBar?.hide() } catch (e: Exception) { }
         prefs = getSharedPreferences("app_state", MODE_PRIVATE)
+        DlEngine.init(applicationContext)
         globalDesktopMode = prefs.getBoolean(KEY_DESKTOP_MODE, false)
         initCamera()
         checkPermissionAndShowDialog()
@@ -285,6 +296,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        if (isUIInitialized) ViewCompat.requestApplyInsets(rootLayout)
         webTabs.getOrNull(currentTabIndex)?.let {
             try { it.webView.onResume() } catch (e: Exception) { }
         }
@@ -307,6 +319,7 @@ class MainActivity : AppCompatActivity() {
             downloadReceiver = null
         } catch (e: Exception) { }
         unregisterChatReceiver()
+        try { DlEngine.removeListener(dlListener); if (::downloadsUi.isInitialized) downloadsUi.onHide() } catch (e: Exception) { }
         releaseTorch()
         pipHideHandler?.removeCallbacks(pipHideRunnable ?: Runnable { })
         super.onDestroy()
@@ -601,26 +614,50 @@ class MainActivity : AppCompatActivity() {
         contentFrame.addView(browserView)
         contentFrame.addView(dialerView)
         contentFrame.addView(smsView)
+        downloadsUi = DownloadsUi(
+            ctx = this,
+            onBack = { hideDownloads() },
+            onOpen = { openDownloaded(it) },
+            onShowFolder = { showDownloadsFolder() },
+            onCopyLink = { copyText(it) }
+        )
+        downloadsView = downloadsUi.root
+        contentFrame.addView(downloadsView)
+        DlEngine.addListener(dlListener)
         contentFrame.addView(shell.buildStartPanel()) // Start menu overlay (must stay last)
 
         rootLayout.addView(contentFrame)
         rootLayout.addView(tabLayout)
         setContentView(rootLayout)
 
-        @Suppress("DEPRECATION")
-        rootLayout.setOnApplyWindowInsetsListener { v, insets ->
-            v.setPadding(
-                insets.systemWindowInsetLeft, insets.systemWindowInsetTop,
-                insets.systemWindowInsetRight, insets.systemWindowInsetBottom
+        // ── System bar insets (status bar / cutout / nav bar / keyboard) ──
+        // Works for edge-to-edge (Android 15+) and older versions alike, so
+        // no screen can ever draw underneath the status bar.
+        ViewCompat.setOnApplyWindowInsetsListener(rootLayout) { v, insets ->
+            val bars = insets.getInsets(
+                WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
             )
-            insets
+            val ime = insets.getInsets(WindowInsetsCompat.Type.ime())
+            @Suppress("DEPRECATION")
+            val legacyBottom = insets.toWindowInsets()?.systemWindowInsetBottom ?: 0
+            v.setPadding(
+                bars.left, bars.top, bars.right,
+                maxOf(bars.bottom, ime.bottom, legacyBottom)
+            )
+            WindowInsetsCompat.CONSUMED
         }
         try {
             @Suppress("DEPRECATION")
             window.statusBarColor = Color.parseColor("#202020")
             @Suppress("DEPRECATION")
             window.navigationBarColor = Color.parseColor("#202020")
+            // dark bars → light (white) icons
+            WindowCompat.getInsetsController(window, rootLayout).apply {
+                isAppearanceLightStatusBars = false
+                isAppearanceLightNavigationBars = false
+            }
         } catch (e: Exception) { }
+        ViewCompat.requestApplyInsets(rootLayout)
         shell.startClock()
         restoreState()
     }
@@ -661,6 +698,7 @@ class MainActivity : AppCompatActivity() {
         browserView.visibility = View.GONE
         dialerView.visibility = View.GONE
         smsView.visibility = View.GONE
+        hideDownloads()
 
         when (target) {
             "desktop" -> {
@@ -2057,57 +2095,28 @@ class MainActivity : AppCompatActivity() {
     // =====================================================================
 
     private fun createFileManagerView(): LinearLayout {
-        val layout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutParams = ViewGroup.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
-            )
+        explorerUi = ExplorerUi(
+            ctx = this,
+            onUp = { goUp() },
+            onNewFolder = { createNewFolder() },
+            onOpenFolder = { loadFiles(it) },
+            onItemClick = { openFile(it) },
+            onItemMenu = { showFileOptions(it) }
+        )
+        return explorerUi.root
+    }
+
+    private fun openFile(file: File) {
+        when {
+            file.isDirectory -> loadFiles(file)
+            file.name.endsWith(".mp4", true) || file.name.endsWith(".mkv", true) ||
+                    file.name.endsWith(".avi", true) -> playVideo(file)
+            file.name.endsWith(".txt", true) -> openTextFile(file)
+            file.name.endsWith(".pdf", true) -> openPdfFile(file)
+            file.name.endsWith(".zip", true) -> showZipOptions(file)
+            isImageFile(file.name) -> openImageFile(file)
+            else -> Toast.makeText(this, "Unsupported file", Toast.LENGTH_SHORT).show()
         }
-        val topBar = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(8), dp(8), dp(8), dp(8))
-            setBackgroundColor(Color.WHITE)
-            elevation = dp(2).toFloat()
-        }
-        val backBtn = Button(this).apply {
-            text = "←"
-            textSize = 24f
-            setBackgroundColor(Color.TRANSPARENT)
-            setOnClickListener { goUp() }
-        }
-        pathText = TextView(this).apply {
-            text = "/"
-            layoutParams =
-                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
-            gravity = Gravity.CENTER_VERTICAL
-            setPadding(dp(8), 0, dp(8), 0)
-            ellipsize = android.text.TextUtils.TruncateAt.START
-            setSingleLine(true)
-            textSize = 14f
-        }
-        val newFolderBtn = Button(this).apply {
-            text = "📁+"
-            textSize = 14f
-            setBackgroundColor(Color.TRANSPARENT)
-            setOnClickListener { createNewFolder() }
-        }
-        topBar.addView(backBtn)
-        topBar.addView(pathText)
-        topBar.addView(newFolderBtn)
-        storageInfo = TextView(this).apply {
-            setPadding(dp(12), dp(4), dp(12), dp(4))
-            textSize = 11f
-            setBackgroundColor(Color.parseColor("#E0E0E0"))
-        }
-        fileListView = ListView(this).apply {
-            layoutParams =
-                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
-            divider = null
-        }
-        layout.addView(topBar)
-        layout.addView(storageInfo)
-        layout.addView(fileListView)
-        return layout
     }
 
     private fun isImageFile(name: String): Boolean {
@@ -2123,76 +2132,15 @@ class MainActivity : AppCompatActivity() {
                 return
             }
             currentPath = dir
-            val storagePath =
-                try { Environment.getExternalStorageDirectory().absolutePath } catch (e: Exception) { "" }
-            pathText.text =
-                dir.absolutePath.replace(storagePath, "/storage/emulated/0")
-            try {
-                storageInfo.text =
-                    "Free: ${getSize(dir.freeSpace)} | Total: ${getSize(dir.totalSpace)}"
-            } catch (e: Exception) { storageInfo.text = "" }
+            val storageRoot = try { Environment.getExternalStorageDirectory() } catch (e: Exception) { File("/storage/emulated/0") }
             val files = try {
                 dir.listFiles()
                     ?.sortedWith(compareBy({ !it.isDirectory }, { it.name.lowercase() }))
                     ?: emptyList()
             } catch (e: Exception) { emptyList() }
-            val adapter = object : ArrayAdapter<File>(
-                this, android.R.layout.simple_list_item_2, android.R.id.text1, files
-            ) {
-                override fun getView(
-                    position: Int, convertView: View?, parent: ViewGroup
-                ): View {
-                    val view = super.getView(position, convertView, parent)
-                    val file = getItem(position) ?: return view
-                    val text1 = view.findViewById<TextView>(android.R.id.text1)
-                    val text2 = view.findViewById<TextView>(android.R.id.text2)
-                    val icon = when {
-                        file.isDirectory -> "📁"
-                        file.name.endsWith(".mp4", true) || file.name.endsWith(
-                            ".mkv", true
-                        ) || file.name.endsWith(".avi", true) -> "🎬"
-                        file.name.endsWith(".pdf", true) -> "📕"
-                        file.name.endsWith(".txt", true) -> "📝"
-                        file.name.endsWith(".zip", true) -> "🗜️"
-                        isImageFile(file.name) -> "🖼️"
-                        else -> "📄"
-                    }
-                    text1.text = "$icon ${file.name}"
-                    text1.setTextColor(Color.BLACK)
-                    text1.textSize = 14f
-                    text2.text = try {
-                        "${getSize(file.length())} | ${
-                            SimpleDateFormat(
-                                "dd/MM/yy HH:mm", Locale.getDefault()
-                            ).format(Date(file.lastModified()))
-                        }"
-                    } catch (e: Exception) { "" }
-                    text2.textSize = 11f
-                    return view
-                }
-            }
-            fileListView.adapter = adapter
-            fileListView.setOnItemClickListener { _, _, position, _ ->
-                if (position >= files.size) return@setOnItemClickListener
-                val file = files[position]
-                when {
-                    file.isDirectory -> loadFiles(file)
-                    file.name.endsWith(".mp4", true) || file.name.endsWith(
-                        ".mkv", true
-                    ) || file.name.endsWith(".avi", true) -> playVideo(file)
-                    file.name.endsWith(".txt", true) -> openTextFile(file)
-                    file.name.endsWith(".pdf", true) -> openPdfFile(file)
-                    file.name.endsWith(".zip", true) -> showZipOptions(file)
-                    isImageFile(file.name) -> openImageFile(file)
-                    else -> Toast.makeText(
-                        this@MainActivity, "Unsupported file", Toast.LENGTH_SHORT
-                    ).show()
-                }
-            }
-            fileListView.setOnItemLongClickListener { _, _, position, _ ->
-                if (position < files.size) showFileOptions(files[position])
-                true
-            }
+            val free = try { dir.freeSpace } catch (e: Exception) { 0L }
+            val total = try { dir.totalSpace } catch (e: Exception) { 0L }
+            explorerUi.show(dir, storageRoot, files, free, total)
         } catch (e: Exception) {
             Toast.makeText(this, "Error loading files: ${e.message}", Toast.LENGTH_SHORT).show()
         }
@@ -2889,89 +2837,323 @@ class MainActivity : AppCompatActivity() {
     // BROWSER
     // =====================================================================
 
+    private fun rippleBg(radiusDp: Int): android.graphics.drawable.RippleDrawable {
+        val mask = android.graphics.drawable.GradientDrawable().apply {
+            cornerRadius = dp(radiusDp).toFloat()
+            setColor(Color.WHITE)
+        }
+        return android.graphics.drawable.RippleDrawable(
+            android.content.res.ColorStateList.valueOf(Color.parseColor("#33FFFFFF")), null, mask
+        )
+    }
+
+    private fun makeToolBtn(icon: View, desc: String, onClick: () -> Unit): FrameLayout =
+        FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(38), dp(40))
+            background = rippleBg(19)
+            isClickable = true
+            contentDescription = desc
+            setOnClickListener { onClick() }
+            addView(icon, FrameLayout.LayoutParams(dp(20), dp(20), Gravity.CENTER))
+        }
+
+    /** Win11 / Edge style tab chip. */
+    private inner class TabChip(val tab: WebTab) : LinearLayout(this@MainActivity) {
+        val title = TextView(this@MainActivity)
+        val close = TextView(this@MainActivity)
+
+        init {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(dp(150), dp(36)).apply { rightMargin = dp(2) }
+            setPadding(dp(12), 0, dp(2), 0)
+            title.apply {
+                textSize = 12.5f
+                setSingleLine(true)
+                ellipsize = android.text.TextUtils.TruncateAt.END
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            }
+            close.apply {
+                text = "✕"
+                textSize = 12f
+                gravity = Gravity.CENTER
+                setTextColor(Color.parseColor("#9D9D9D"))
+                layoutParams = LinearLayout.LayoutParams(dp(30), ViewGroup.LayoutParams.MATCH_PARENT)
+            }
+            addView(title)
+            addView(close)
+            setActive(false)
+        }
+
+        fun setActive(active: Boolean) {
+            val r = dp(8).toFloat()
+            background = android.graphics.drawable.GradientDrawable().apply {
+                cornerRadii = floatArrayOf(r, r, r, r, 0f, 0f, 0f, 0f)
+                setColor(Color.parseColor(if (active) "#2B2B2B" else "#262626"))
+            }
+            title.setTextColor(if (active) Color.WHITE else Color.parseColor("#B0B0B0"))
+        }
+    }
+
     private fun createBrowserView(): LinearLayout {
+        val accent = Color.parseColor("#4CC2FF")
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             layoutParams = ViewGroup.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT
             )
+            setBackgroundColor(Color.parseColor("#191919"))
         }
+
+        // ── Tab strip ───────────────────────────────────────────
         val tabBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setBackgroundColor(Color.parseColor("#2A2A2A"))
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, dp(40)
-            )
+            gravity = Gravity.BOTTOM
+            setBackgroundColor(Color.parseColor("#202020"))
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(42))
+            setPadding(dp(6), dp(6), dp(4), 0)
         }
         tabScroll = HorizontalScrollView(this).apply {
-            layoutParams =
-                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
             isHorizontalScrollBarEnabled = false
+            overScrollMode = View.OVER_SCROLL_NEVER
         }
-        tabContainer = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        tabScroll.addView(tabContainer)
-        val newTabBtn = Button(this).apply {
+        tabContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.BOTTOM
+        }
+        tabScroll.addView(
+            tabContainer,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.MATCH_PARENT
+            )
+        )
+        val newTabBtn = TextView(this).apply {
             text = "+"
-            textSize = 18f
+            textSize = 22f
             setTextColor(Color.WHITE)
-            setBackgroundColor(Color.parseColor("#444444"))
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(dp(40), dp(36))
+            background = rippleBg(8)
+            isClickable = true
+            contentDescription = "New tab"
             setOnClickListener { addNewTab("https://www.google.com", switch = true) }
         }
         tabBar.addView(tabScroll)
         tabBar.addView(newTabBtn)
 
-        val urlLayout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setBackgroundColor(Color.WHITE)
-        }
-        val urlBarLayout = LinearLayout(this).apply {
+        // ── Toolbar: back, forward, address pill, desktop, downloads ──
+        val toolbar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
-            setPadding(dp(8), dp(8), dp(8), dp(8))
+            gravity = Gravity.CENTER_VERTICAL
+            setBackgroundColor(Color.parseColor("#2B2B2B"))
+            setPadding(dp(4), dp(6), dp(4), dp(6))
         }
+        backNavIcon = VectorIconView(this, VectorIconView.BACK)
+        fwdNavIcon = VectorIconView(this, VectorIconView.BACK).apply { rotation = 180f }
+        toolbar.addView(makeToolBtn(backNavIcon, "Back") {
+            try { webTabs.getOrNull(currentTabIndex)?.webView?.let { if (it.canGoBack()) it.goBack() } } catch (e: Exception) { }
+        })
+        toolbar.addView(makeToolBtn(fwdNavIcon, "Forward") {
+            try { webTabs.getOrNull(currentTabIndex)?.webView?.let { if (it.canGoForward()) it.goForward() } } catch (e: Exception) { }
+        })
+
+        val pill = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, dp(40), 1f).apply {
+                leftMargin = dp(2); rightMargin = dp(2)
+            }
+            background = android.graphics.drawable.GradientDrawable().apply {
+                cornerRadius = dp(20).toFloat()
+                setColor(Color.parseColor("#1F1F1F"))
+                setStroke(1, Color.parseColor("#3A3A3A"))
+            }
+            setPadding(dp(12), 0, dp(2), 0)
+        }
+        pill.addView(VectorIconView(this, VectorIconView.SEARCH).apply {
+            setIconColor(Color.parseColor("#9D9D9D"))
+            layoutParams = LinearLayout.LayoutParams(dp(16), dp(16))
+        })
         urlBar = EditText(this).apply {
             hint = "Enter URL or search"
-            layoutParams =
-                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            setHintTextColor(Color.parseColor("#8A8A8A"))
+            setTextColor(Color.WHITE)
+            textSize = 14f
+            background = null
+            setPadding(dp(8), 0, dp(4), 0)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 1f)
             setSingleLine(true)
-            setOnEditorActionListener { _, _, _ -> loadUrlInCurrentTab(); true }
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or
+                    android.text.InputType.TYPE_TEXT_VARIATION_URI
+            imeOptions = android.view.inputmethod.EditorInfo.IME_ACTION_GO
+            setSelectAllOnFocus(true)
+            setOnEditorActionListener { _, _, _ -> submitUrl(); true }
+            setOnFocusChangeListener { _, _ -> updateReloadIcon() }
         }
-        val goBtn = Button(this).apply { text = "Go"; setOnClickListener { loadUrlInCurrentTab() } }
-        val desktopBtn = Button(this).apply {
-            text = "💻"
-            textSize = 16f
+        pill.addView(urlBar)
+        reloadBtn = TextView(this).apply {
+            text = "↻"
+            textSize = 18f
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            layoutParams = LinearLayout.LayoutParams(dp(38), dp(38))
+            background = rippleBg(19)
+            isClickable = true
             setOnClickListener {
-                val tab = webTabs.getOrNull(currentTabIndex) ?: return@setOnClickListener
-                tab.isDesktopMode = !tab.isDesktopMode
-                text = if (tab.isDesktopMode) "📱" else "💻"
-                Toast.makeText(
-                    this@MainActivity,
-                    if (tab.isDesktopMode) "Desktop Mode ON" else "Desktop Mode OFF",
-                    Toast.LENGTH_SHORT
-                ).show()
-                updateDesktopModeForTab(tab)
-                tab.webView.reload()
+                val wv = webTabs.getOrNull(currentTabIndex)?.webView
+                when {
+                    urlBar.hasFocus() -> submitUrl()
+                    isPageLoading -> try { wv?.stopLoading() } catch (e: Exception) { }
+                    else -> try { wv?.reload() } catch (e: Exception) { }
+                }
             }
         }
-        urlBarLayout.addView(urlBar)
-        urlBarLayout.addView(goBtn)
-        urlBarLayout.addView(desktopBtn)
+        pill.addView(reloadBtn)
+        toolbar.addView(pill)
+
+        desktopIcon = VectorIconView(this, VectorIconView.PC).apply {
+            setIconColor(Color.parseColor("#B0B0B0"))
+        }
+        toolbar.addView(makeToolBtn(desktopIcon, "Desktop site") {
+            val tab = webTabs.getOrNull(currentTabIndex) ?: return@makeToolBtn
+            tab.isDesktopMode = !tab.isDesktopMode
+            updateDesktopBtnIcon()
+            Toast.makeText(
+                this@MainActivity,
+                if (tab.isDesktopMode) "Desktop Mode ON" else "Desktop Mode OFF",
+                Toast.LENGTH_SHORT
+            ).show()
+            updateDesktopModeForTab(tab)
+            tab.webView.reload()
+        })
+
+        val dlHolder = FrameLayout(this).apply {
+            layoutParams = LinearLayout.LayoutParams(dp(38), dp(40))
+            background = rippleBg(19)
+            isClickable = true
+            contentDescription = "Downloads"
+            setOnClickListener { showDownloads() }
+            addView(
+                VectorIconView(this@MainActivity, VectorIconView.DOWNLOAD),
+                FrameLayout.LayoutParams(dp(20), dp(20), Gravity.CENTER)
+            )
+        }
+        dlBadge = TextView(this).apply {
+            textSize = 9f
+            setTextColor(Color.BLACK)
+            gravity = Gravity.CENTER
+            typeface = Typeface.DEFAULT_BOLD
+            background = android.graphics.drawable.GradientDrawable().apply {
+                shape = android.graphics.drawable.GradientDrawable.OVAL
+                setColor(accent)
+            }
+            visibility = View.GONE
+        }
+        dlHolder.addView(dlBadge, FrameLayout.LayoutParams(dp(15), dp(15), Gravity.TOP or Gravity.END).apply {
+            topMargin = dp(3); rightMargin = dp(2)
+        })
+        toolbar.addView(dlHolder)
+
         progressBar =
             ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
-                layoutParams =
-                    LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(3))
+                layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(2))
                 max = 100
+                progressTintList = android.content.res.ColorStateList.valueOf(accent)
+                progressBackgroundTintList =
+                    android.content.res.ColorStateList.valueOf(Color.parseColor("#2B2B2B"))
                 visibility = View.GONE
             }
-        urlLayout.addView(urlBarLayout)
-        urlLayout.addView(progressBar)
         webContainer = FrameLayout(this).apply {
-            layoutParams =
-                LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+            setBackgroundColor(Color.parseColor("#191919"))
         }
         layout.addView(tabBar)
-        layout.addView(urlLayout)
+        layout.addView(toolbar)
+        layout.addView(progressBar)
         layout.addView(webContainer)
         return layout
+    }
+
+    private fun submitUrl() {
+        loadUrlInCurrentTab()
+        try {
+            urlBar.clearFocus()
+            val imm = getSystemService(Context.INPUT_METHOD_SERVICE) as android.view.inputmethod.InputMethodManager
+            imm.hideSoftInputFromWindow(urlBar.windowToken, 0)
+        } catch (e: Exception) { }
+        updateReloadIcon()
+    }
+
+    private fun updateReloadIcon() {
+        if (!::reloadBtn.isInitialized) return
+        reloadBtn.text = when {
+            urlBar.hasFocus() -> "→"
+            isPageLoading -> "✕"
+            else -> "↻"
+        }
+    }
+
+    private fun updateNavButtons() {
+        if (!::backNavIcon.isInitialized) return
+        val wv = webTabs.getOrNull(currentTabIndex)?.webView
+        try {
+            backNavIcon.alpha = if (wv?.canGoBack() == true) 1f else 0.35f
+            fwdNavIcon.alpha = if (wv?.canGoForward() == true) 1f else 0.35f
+        } catch (e: Exception) { }
+    }
+
+    private fun updateDownloadBadge() {
+        if (!::dlBadge.isInitialized) return
+        val n = DlEngine.activeCount()
+        dlBadge.visibility = if (n > 0) View.VISIBLE else View.GONE
+        dlBadge.text = if (n > 9) "9+" else n.toString()
+    }
+
+    // ── Downloads screen ──────────────────────────────────────────
+    private fun showDownloads() {
+        if (!::downloadsView.isInitialized) return
+        downloadsView.visibility = View.VISIBLE
+        downloadsUi.onShow()
+    }
+
+    private fun hideDownloads() {
+        if (!::downloadsView.isInitialized) return
+        if (downloadsView.visibility == View.VISIBLE) {
+            downloadsView.visibility = View.GONE
+            downloadsUi.onHide()
+        }
+    }
+
+    private fun showDownloadsFolder() {
+        try {
+            val dir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            hideDownloads()
+            switchToSection("files")
+            loadFiles(dir)
+        } catch (e: Exception) { }
+    }
+
+    private fun openDownloaded(t: DlTask) {
+        try {
+            val uri = t.savedUri.takeIf { it.isNotEmpty() }?.let { Uri.parse(it) }
+            if (uri == null) {
+                Toast.makeText(this, "File not available", Toast.LENGTH_SHORT).show()
+                return
+            }
+            val mime = t.mime.ifBlank { DlEngine.guessMime(t.fileName) }
+            val view = Intent(Intent.ACTION_VIEW).setDataAndType(uri, mime)
+                .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            startActivity(Intent.createChooser(view, "Open with"))
+        } catch (e: Exception) {
+            Toast.makeText(this, "No app can open this file", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun copyText(text: String) {
+        val cm = getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+        cm.setPrimaryClip(android.content.ClipData.newPlainText("Link", text))
+        Toast.makeText(this, "Link copied", Toast.LENGTH_SHORT).show()
     }
 
     private fun updateDesktopModeForTab(tab: WebTab) {
@@ -3036,6 +3218,8 @@ class MainActivity : AppCompatActivity() {
                         progressBar.visibility = View.VISIBLE; urlBar.setText(url)
                     }
                     if (idx != -1) webTabs[idx].url = url ?: ""
+                    view?.evaluateJavascript(BLOB_HOOK_JS, null)
+                    updateNavButtons()
                 }
                 override fun onPageFinished(view: WebView?, url: String?) {
                     val idx = webTabs.indexOfFirst { it.webView == view }
@@ -3044,6 +3228,8 @@ class MainActivity : AppCompatActivity() {
                     }
                     if (idx != -1) webTabs[idx].url = url ?: ""
                     view?.let { injectImageLongClickSave(it) }
+                    view?.evaluateJavascript(BLOB_HOOK_JS, null)
+                    updateNavButtons()
                 }
                 override fun onReceivedError(
                     view: WebView?,
@@ -3065,6 +3251,8 @@ class MainActivity : AppCompatActivity() {
                         progressBar.progress = newProgress
                         progressBar.visibility =
                             if (newProgress < 100) View.VISIBLE else View.GONE
+                        isPageLoading = newProgress < 100
+                        updateReloadIcon()
                     }
                 }
                 override fun onReceivedTitle(view: WebView?, title: String?) {
@@ -3138,6 +3326,7 @@ class MainActivity : AppCompatActivity() {
                     @Suppress("DEPRECATION")
                     window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
                     tabLayout.visibility = View.VISIBLE
+                    if (::rootLayout.isInitialized) ViewCompat.requestApplyInsets(rootLayout)
                     customViewCallback?.onCustomViewHidden()
                     customViewCallback = null
                 }
@@ -3157,27 +3346,25 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
+            webView.addJavascriptInterface(BlobBridge(), "AndroidBlobDl")
             webView.setDownloadListener { dlUrl, ua, cd, mime, len ->
                 handleDownload(dlUrl, ua, cd, mime, len, webView)
             }
+            webView.setOnLongClickListener { v ->
+                val hit = (v as WebView).hitTestResult
+                val extra = hit.extra
+                if (hit.type == WebView.HitTestResult.SRC_ANCHOR_TYPE && !extra.isNullOrEmpty()) {
+                    showLinkDialog(extra, webView); true
+                } else false
+            }
             webContainer.addView(webView)
             val tabIndex = webTabs.size - 1
-            val tabButton = Button(this).apply {
-                text = "Tab ${tabIndex + 1}"
-                textSize = 11f
-                setTextColor(Color.WHITE)
-                setBackgroundColor(Color.parseColor("#444444"))
-                layoutParams =
-                    LinearLayout.LayoutParams(dp(70), ViewGroup.LayoutParams.MATCH_PARENT).apply {
-                        setMargins(dp(2), dp(2), dp(2), dp(2))
-                    }
-                setPadding(dp(4), 0, dp(4), 0)
-                setSingleLine(true)
-                ellipsize = android.text.TextUtils.TruncateAt.END
-                setOnClickListener { switchTab(webTabs.indexOf(tab)) }
-                setOnLongClickListener { closeTab(webTabs.indexOf(tab)); true }
-            }
-            tabContainer.addView(tabButton)
+            val chip = TabChip(tab)
+            chip.title.text = "New Tab"
+            chip.setOnClickListener { switchTab(webTabs.indexOf(tab)) }
+            chip.setOnLongClickListener { closeTab(webTabs.indexOf(tab)); true }
+            chip.close.setOnClickListener { closeTab(webTabs.indexOf(tab)) }
+            tabContainer.addView(chip)
             webView.loadUrl(url)
             if (switch) switchTab(tabIndex)
         } catch (e: Exception) {
@@ -3205,21 +3392,16 @@ class MainActivity : AppCompatActivity() {
         progressBar.visibility = View.GONE
         updateTabTitles()
         updateDesktopBtnIcon()
+        updateNavButtons()
+        updateReloadIcon()
     }
 
     private fun updateDesktopBtnIcon() {
+        if (!::desktopIcon.isInitialized) return
         val tab = webTabs.getOrNull(currentTabIndex) ?: return
-        try {
-            val urlBarLayout =
-                (browserView.getChildAt(1) as? LinearLayout)?.getChildAt(0) as? LinearLayout
-                    ?: return
-            for (i in 0 until urlBarLayout.childCount) {
-                val child = urlBarLayout.getChildAt(i)
-                if (child is Button && (child.text == "💻" || child.text == "📱")) {
-                    child.text = if (tab.isDesktopMode) "📱" else "💻"; break
-                }
-            }
-        } catch (e: Exception) { }
+        desktopIcon.setIconColor(
+            if (tab.isDesktopMode) Color.parseColor("#4CC2FF") else Color.parseColor("#B0B0B0")
+        )
     }
 
     private fun closeTab(index: Int): Boolean {
@@ -3242,13 +3424,10 @@ class MainActivity : AppCompatActivity() {
 
     private fun updateTabTitles() {
         for (i in 0 until tabContainer.childCount) {
-            val btn = tabContainer.getChildAt(i) as? Button ?: continue
-            val title = if (i < webTabs.size) webTabs[i].title else "Tab ${i + 1}"
-            btn.text = if (title.length > 7) title.substring(0, 6) + "…" else title
-            btn.setBackgroundColor(
-                if (i == currentTabIndex) Color.parseColor("#6200EE")
-                else Color.parseColor("#444444")
-            )
+            val chip = tabContainer.getChildAt(i) as? TabChip ?: continue
+            chip.title.text =
+                if (i < webTabs.size) webTabs[i].title.ifBlank { "New Tab" } else "Tab ${i + 1}"
+            chip.setActive(i == currentTabIndex)
         }
     }
 
@@ -3326,9 +3505,10 @@ class MainActivity : AppCompatActivity() {
                 val ua = try { webView.settings.userAgentString } catch (e: Exception) { "" }
                 val ext = imageUrl.substringAfterLast(".").substringBefore("?").lowercase()
                     .takeIf { it.length in 2..5 } ?: "jpg"
-                downloadManually(
-                    imageUrl, cookies, ua, "", "image/*",
-                    "image_${System.currentTimeMillis()}.$ext"
+                val referer = try { webView.url ?: "" } catch (e: Exception) { "" }
+                enqueueDownload(
+                    imageUrl, "image_${System.currentTimeMillis()}.$ext", "",
+                    cookies, ua, referer
                 )
             }
         }
@@ -3365,6 +3545,65 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun ensureNotifPermission() {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(this, "android.permission.POST_NOTIFICATIONS")
+            != PackageManager.PERMISSION_GRANTED &&
+            !prefs.getBoolean("asked_notif_perm", false)
+        ) {
+            prefs.edit().putBoolean("asked_notif_perm", true).apply()
+            ActivityCompat.requestPermissions(this, arrayOf("android.permission.POST_NOTIFICATIONS"), 301)
+        }
+    }
+
+    private fun enqueueDownload(
+        url: String, fileName: String, mime: String, cookies: String,
+        ua: String, referer: String, total: Long = -1L
+    ) {
+        ensureNotifPermission()
+        val t = DlEngine.enqueue(url, fileName, mime, cookies, ua, referer, total)
+        Toast.makeText(this, "⬇️ Download started: ${t.fileName}", Toast.LENGTH_SHORT).show()
+        updateDownloadBadge()
+    }
+
+    /** Dialog with size + editable file name, shared by normal and blob downloads. */
+    private fun showDownloadDialog(
+        sizeText: String, defaultName: String, onConfirm: (String) -> Unit
+    ) {
+        val dialogView = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(16), dp(20), dp(8))
+        }
+        dialogView.addView(TextView(this).apply {
+            text = "📦 Size: $sizeText"
+            textSize = 13f
+            setTextColor(Color.parseColor("#555555"))
+            setPadding(0, 0, 0, dp(4))
+        })
+        dialogView.addView(TextView(this).apply {
+            text = "📁 Saved to: Downloads"
+            textSize = 13f
+            setTextColor(Color.parseColor("#555555"))
+            setPadding(0, 0, 0, dp(12))
+        })
+        dialogView.addView(TextView(this).apply {
+            text = "File name (editable):"
+            textSize = 13f
+            setTextColor(Color.parseColor("#333333"))
+            typeface = Typeface.DEFAULT_BOLD
+            setPadding(0, 0, 0, dp(4))
+        })
+        val fileNameInput = EditText(this).apply {
+            setText(defaultName); textSize = 14f; setSingleLine(true); post { selectAll() }
+        }
+        dialogView.addView(fileNameInput)
+        AlertDialog.Builder(this).setTitle("⬇️ Download File").setView(dialogView)
+            .setPositiveButton("Download") { _, _ ->
+                val inputName = fileNameInput.text.toString().trim()
+                onConfirm(sanitizeFileName(inputName.ifBlank { defaultName }))
+            }.setNegativeButton("Cancel", null).show()
+    }
+
     private fun downloadWithManager(
         url: String, userAgentStr: String, contentDisposition: String,
         mimetype: String, contentLength: Long, webView: WebView
@@ -3376,105 +3615,44 @@ class MainActivity : AppCompatActivity() {
             val ua = if (userAgentStr.isBlank()) {
                 try { webView.settings.userAgentString } catch (e: Exception) { userAgentStr }
             } else userAgentStr
-
-            val dialogView = LinearLayout(this).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(dp(20), dp(16), dp(20), dp(8))
-            }
+            val referer = try { webView.url ?: "" } catch (e: Exception) { "" }
             val sizeText = if (contentLength > 0) getSize(contentLength) else "Unknown size"
-            dialogView.addView(TextView(this).apply {
-                text = "📦 Size: $sizeText"
-                textSize = 13f
-                setTextColor(Color.parseColor("#555555"))
-                setPadding(0, 0, 0, dp(12))
-            })
-            dialogView.addView(TextView(this).apply {
-                text = "File name (editable):"
-                textSize = 13f
-                setTextColor(Color.parseColor("#333333"))
-                typeface = Typeface.DEFAULT_BOLD
-                setPadding(0, 0, 0, dp(4))
-            })
-            val fileNameInput = EditText(this).apply {
-                setText(defaultFileName); textSize = 14f; setSingleLine(true); post { selectAll() }
+            showDownloadDialog(sizeText, defaultFileName) { fileName ->
+                enqueueDownload(url, fileName, mimetype, cookies, ua, referer, contentLength)
             }
-            dialogView.addView(fileNameInput)
-            AlertDialog.Builder(this).setTitle("⬇️ Download File").setView(dialogView)
-                .setPositiveButton("Download") { _, _ ->
-                    val inputName = fileNameInput.text.toString().trim()
-                    val fileName = sanitizeFileName(inputName.ifBlank { defaultFileName })
-                    try {
-                        val parsedUri = Uri.parse(url)
-                        val request = DownloadManager.Request(parsedUri).apply {
-                            setTitle(fileName)
-                            setDescription("Downloading…")
-                            setMimeType(mimetype.ifBlank { "application/octet-stream" })
-                            setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                            if (cookies.isNotEmpty()) addRequestHeader("Cookie", cookies)
-                            if (ua.isNotEmpty()) addRequestHeader("User-Agent", ua)
-                            try {
-                                addRequestHeader(
-                                    "Referer", "${parsedUri.scheme}://${parsedUri.host}"
-                                )
-                            } catch (e: Exception) { }
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
-                                setDestinationInExternalPublicDir(
-                                    Environment.DIRECTORY_DOWNLOADS, fileName
-                                )
-                            else {
-                                val destDir = Environment.getExternalStoragePublicDirectory(
-                                    Environment.DIRECTORY_DOWNLOADS
-                                )
-                                destDir.mkdirs()
-                                setDestinationUri(Uri.fromFile(File(destDir, fileName)))
-                            }
-                            setAllowedOverMetered(true)
-                            setAllowedOverRoaming(true)
-                        }
-                        val dm = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-                        val downloadId = dm.enqueue(request)
-                        activeDownloads[downloadId] = fileName
-                        registerDownloadReceiver()
-                        Toast.makeText(
-                            this, "⬇️ শুরু হয়েছে: $fileName", Toast.LENGTH_SHORT
-                        ).show()
-                    } catch (e: Exception) {
-                        Toast.makeText(
-                            this, "DownloadManager ব্যর্থ, retry করছে...", Toast.LENGTH_SHORT
-                        ).show()
-                        downloadManually(url, cookies, ua, contentDisposition, mimetype, fileName)
-                    }
-                }.setNegativeButton("Cancel", null).show()
         } catch (e: Exception) {
             Toast.makeText(this, "Download error: ${e.message}", Toast.LENGTH_SHORT).show()
         }
     }
 
+    /** blob: URLs only exist inside the page, so the page streams the bytes to us. */
     private fun downloadBlobUrl(blobUrl: String, webView: WebView) {
-        val js = """
-            javascript:(function() {
-                var xhr = new XMLHttpRequest();
-                xhr.open('GET', '$blobUrl', true);
-                xhr.responseType = 'blob';
-                xhr.onload = function(e) {
-                    if (this.status == 200) {
-                        var blob = this.response;
-                        var reader = new FileReader();
-                        reader.readAsDataURL(blob);
-                        reader.onloadend = function() { AndroidInterface.downloadBase64(reader.result, blob.type); }
-                    }
-                };
-                xhr.send();
-            })()
-        """.trimIndent()
-        webView.addJavascriptInterface(object {
-            @JavascriptInterface
-            fun downloadBase64(dataUrl: String, mimeType: String) {
-                runOnUiThread { downloadDataUrl(dataUrl, mimeType) }
+        val q = "(function(u){try{var n=(window.__w11names||{})[u]||'';" +
+                "var i=(window.__w11types||{})[u]||{};" +
+                "return JSON.stringify({n:n,t:i.type||'',s:i.size||0});}" +
+                "catch(e){return JSON.stringify({n:'',t:'',s:0});}})(" +
+                org.json.JSONObject.quote(blobUrl) + ")"
+        webView.evaluateJavascript(q) { raw ->
+            var name = ""; var mime = ""; var size = 0L
+            try {
+                val str = org.json.JSONTokener(raw).nextValue() as? String
+                if (str != null) {
+                    val o = org.json.JSONObject(str)
+                    name = o.optString("n"); mime = o.optString("t"); size = o.optLong("s")
+                }
+            } catch (e: Exception) { }
+            val ext = MimeTypeMap.getSingleton().getExtensionFromMimeType(mime) ?: ""
+            if (name.isBlank()) name = "download_${System.currentTimeMillis()}" + (if (ext.isNotEmpty()) ".$ext" else "")
+            else if (!name.contains('.') && ext.isNotEmpty()) name = "$name.$ext"
+            val finalName = sanitizeFileName(name)
+            showDownloadDialog(if (size > 0) getSize(size) else "Unknown size", finalName) { chosen ->
+                ensureNotifPermission()
+                val task = DlEngine.beginBlob(chosen, mime, size)
+                webView.evaluateJavascript(blobTransferJs(org.json.JSONObject.quote(blobUrl), task.id), null)
+                Toast.makeText(this, "⬇️ Download started: $chosen", Toast.LENGTH_SHORT).show()
+                updateDownloadBadge()
             }
-        }, "AndroidInterface")
-        webView.evaluateJavascript(js, null)
-        Toast.makeText(this, "Blob ফাইল প্রস্তুত করছে...", Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun downloadDataUrl(dataUrl: String, overrideMime: String = "") {
@@ -3487,45 +3665,19 @@ class MainActivity : AppCompatActivity() {
                     }; return@Thread
                 }
                 val header = dataUrl.substring(0, commaIdx)
-                val base64Data = dataUrl.substring(commaIdx + 1)
+                val payload = dataUrl.substring(commaIdx + 1)
                 val mimeType = if (overrideMime.isNotEmpty()) overrideMime
                 else header.substringAfter("data:").substringBefore(";")
                     .ifBlank { "application/octet-stream" }
-                val ext =
-                    MimeTypeMap.getSingleton().getExtensionFromMimeType(mimeType) ?: "bin"
+                val ext = MimeTypeMap.getSingleton().getExtensionFromMimeType(mimeType) ?: "bin"
                 val fileName = "download_${System.currentTimeMillis()}.$ext"
-                val bytes = Base64.decode(base64Data, Base64.DEFAULT)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    val cv = ContentValues().apply {
-                        put(MediaStore.Downloads.DISPLAY_NAME, fileName)
-                        put(MediaStore.Downloads.MIME_TYPE, mimeType)
-                        put(
-                            MediaStore.Downloads.RELATIVE_PATH,
-                            Environment.DIRECTORY_DOWNLOADS
-                        )
-                    }
-                    val uri =
-                        contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv)
-                    if (uri != null) {
-                        contentResolver.openOutputStream(uri)?.use { it.write(bytes) }
-                        runOnUiThread {
-                            Toast.makeText(
-                                this, "✅ সংরক্ষিত: $fileName", Toast.LENGTH_LONG
-                            ).show()
-                        }
-                    } else runOnUiThread {
-                        Toast.makeText(this, "Save failed", Toast.LENGTH_SHORT).show()
-                    }
-                } else {
-                    val destDir =
-                        Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-                    destDir.mkdirs()
-                    FileOutputStream(File(destDir, fileName)).use { it.write(bytes) }
-                    runOnUiThread {
-                        Toast.makeText(
-                            this, "✅ সংরক্ষিত: $fileName", Toast.LENGTH_LONG
-                        ).show()
-                    }
+                val bytes = if (header.contains("base64")) Base64.decode(payload, Base64.DEFAULT)
+                else Uri.decode(payload).toByteArray(Charsets.UTF_8)
+                DlEngine.saveBytes(fileName, mimeType, bytes)
+                runOnUiThread {
+                    ensureNotifPermission()
+                    Toast.makeText(this, "⬇️ Saving: $fileName", Toast.LENGTH_SHORT).show()
+                    updateDownloadBadge()
                 }
             } catch (e: Exception) {
                 runOnUiThread {
@@ -3535,6 +3687,21 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }.start()
+    }
+
+    private fun showLinkDialog(link: String, webView: WebView) {
+        val options = arrayOf("🌐 Open in new tab", "⬇️ Download link", "🔗 Copy link")
+        AlertDialog.Builder(this).setTitle(link).setItems(options) { _, which ->
+            when (which) {
+                0 -> addNewTab(link, switch = true)
+                1 -> {
+                    if (link.startsWith("blob:")) downloadBlobUrl(link, webView)
+                    else if (link.startsWith("data:")) downloadDataUrl(link)
+                    else downloadWithManager(link, "", "", "", -1L, webView)
+                }
+                2 -> copyText(link)
+            }
+        }.setNegativeButton("Cancel", null).show()
     }
 
     private fun downloadManually(
@@ -3701,12 +3868,17 @@ class MainActivity : AppCompatActivity() {
             if (shell.isStartOpen()) shell.closeStart()
             switchToSection("desktop")
         }
+        if (intent?.getBooleanExtra("open_downloads", false) == true && isUIInitialized) {
+            switchToSection("browser")
+            showDownloads()
+        }
     }
 
     @Deprecated("Deprecated in Java")
     override fun onBackPressed() {
         when {
             ::shell.isInitialized && shell.isStartOpen() -> { if (!shell.handleBack()) shell.closeStart() }
+            ::downloadsView.isInitialized && downloadsView.visibility == View.VISIBLE -> hideDownloads()
             customView != null -> {
                 val chromeClient = try {
                     webTabs[currentTabIndex].webView.webChromeClient

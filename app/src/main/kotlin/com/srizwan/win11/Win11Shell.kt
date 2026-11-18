@@ -88,6 +88,7 @@ class VectorIconView(context: Context, private val type: String) : View(context)
         const val BACK = "back"
         const val DELETE = "delete"
         const val BELL = "bell"
+        const val DOWNLOAD = "download"
 
         private fun data(type: String): String? = when (type) {
             FILES -> "M10,4H4c-1.1,0 -1.99,0.9 -1.99,2L2,18c0,1.1 0.9,2 2,2h16c1.1,0 2,-0.9 2,-2V8c0,-1.1 -0.9,-2 -2,-2h-8l-2,-2z"
@@ -102,6 +103,7 @@ class VectorIconView(context: Context, private val type: String) : View(context)
             SEND -> "M2.01,21L23,12 2.01,3 2,10l15,2 -15,2z"
             EDIT -> "M3,17.25V21h3.75L17.81,9.94l-3.75,-3.75L3,17.25zM20.71,7.04c0.39,-0.39 0.39,-1.02 0,-1.41l-2.34,-2.34c-0.39,-0.39 -1.02,-0.39 -1.41,0l-1.83,1.83 3.75,3.75 1.83,-1.83z"
             BACK -> "M20,11H7.83l5.59,-5.59L12,4l-8,8 8,8 1.41,-1.41L7.83,13H20v-2z"
+            DOWNLOAD -> "M19,9h-4V3H9v6H5l7,7 7,-7zM5,18v2h14v-2H5z"
             BELL -> "M12,22c1.1,0 2,-0.9 2,-2h-4c0,1.1 0.89,2 2,2zM18,16v-5c0,-3.07 -1.64,-5.64 -4.5,-6.32V4c0,-0.83 -0.67,-1.5 -1.5,-1.5s-1.5,0.67 -1.5,1.5v0.68C7.63,5.36 6,7.92 6,11v5l-2,2v1h16v-1l-2,-2z"
             DELETE -> "M6,19c0,1.1 0.9,2 2,2h8c1.1,0 2,-0.9 2,-2V7H6v12zM19,4h-3.5l-1,-1h-5l-1,1H5v2h14V4z"
             else -> null
