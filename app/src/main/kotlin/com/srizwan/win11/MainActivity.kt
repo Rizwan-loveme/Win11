@@ -8,6 +8,9 @@ import android.app.Dialog
 import android.app.role.RoleManager
 import android.app.DownloadManager
 import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.ComponentName
 import android.content.ContentValues
@@ -49,6 +52,7 @@ import android.widget.VideoView
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowCompat
@@ -215,6 +219,7 @@ class MainActivity : AppCompatActivity() {
     private val REQ_SMS = 202
     private val REQ_CONTACTS = 203
     private val REQ_CALL_LOG = 204
+    private val TAG_DEBUG = "RizwanS2.MainActivity"
 
     data class WebTab(
         val webView: WebView,
@@ -238,6 +243,7 @@ class MainActivity : AppCompatActivity() {
 
     private val storagePermissionLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+            Logger.d(TAG_DEBUG, "storagePermissionLauncher result: granted=${Environment.isExternalStorageManager()}")
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
                 if (!Environment.isExternalStorageManager())
                     Toast.makeText(this, "Storage permission required", Toast.LENGTH_SHORT).show()
@@ -268,16 +274,80 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        Logger.d(TAG_DEBUG, "onCreate: start")
+        postDebugLogNotification()
+        startUiWatchdog()
         try { supportActionBar?.hide() } catch (e: Exception) { }
         prefs = getSharedPreferences("app_state", MODE_PRIVATE)
-        DlEngine.init(applicationContext)
+        try {
+            DlEngine.init(applicationContext)
+            Logger.d(TAG_DEBUG, "onCreate: DlEngine.init OK")
+        } catch (e: Throwable) {
+            Logger.e(TAG_DEBUG, "onCreate: DlEngine.init FAILED", e)
+        }
         globalDesktopMode = prefs.getBoolean(KEY_DESKTOP_MODE, false)
-        initCamera()
+        try {
+            initCamera()
+            Logger.d(TAG_DEBUG, "onCreate: initCamera OK")
+        } catch (e: Throwable) {
+            Logger.e(TAG_DEBUG, "onCreate: initCamera FAILED (non-fatal, continuing)", e)
+        }
+        Logger.d(TAG_DEBUG, "onCreate: calling checkPermissionAndShowDialog")
         checkPermissionAndShowDialog()
         if (!isDefaultLauncher() && !prefs.getBoolean("asked_default_launcher", false)) {
             prefs.edit().putBoolean("asked_default_launcher", true).apply()
             requestDefaultLauncher()
         }
+        Logger.d(TAG_DEBUG, "onCreate: end (UI init may still be pending on a permission result)")
+    }
+
+    /**
+     * Posts a small notification pointing at [DebugLogActivity], once per process.
+     * The notification shade is a separate system surface from the launcher's own
+     * screen, so this stays reachable even if the home screen itself is stuck black.
+     */
+    private fun postDebugLogNotification() {
+        try {
+            val channelId = "debug_log"
+            val nm = getSystemService(NotificationManager::class.java)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                nm?.createNotificationChannel(
+                    NotificationChannel(channelId, "Debug log", NotificationManager.IMPORTANCE_MIN)
+                )
+            }
+            val pi = PendingIntent.getActivity(
+                this, 0, Intent(this, DebugLogActivity::class.java),
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+            val notif = androidx.core.app.NotificationCompat.Builder(this, channelId)
+                .setSmallIcon(android.R.drawable.ic_menu_info_details)
+                .setContentTitle("RizwanS2 debug log")
+                .setContentText("Tap to view log (works even if home screen is black)")
+                .setOngoing(true)
+                .setContentIntent(pi)
+                .build()
+            if (ActivityCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                == PackageManager.PERMISSION_GRANTED || Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU
+            ) {
+                NotificationManagerCompat.from(this).notify(9091, notif)
+            }
+        } catch (e: Throwable) {
+            Logger.e(TAG_DEBUG, "postDebugLogNotification failed", e)
+        }
+    }
+
+    /** Logs (not crashes) if the UI never finishes initializing — the "silent black screen" case. */
+    private fun startUiWatchdog() {
+        Handler(Looper.getMainLooper()).postDelayed({
+            if (!isUIInitialized) {
+                Logger.w(
+                    TAG_DEBUG,
+                    "WATCHDOG: UI still not initialized 8s after onCreate — " +
+                        "likely stuck waiting on a permission dialog, or initUI() threw " +
+                        "before reaching setContentView(). Check the lines just above this one."
+                )
+            }
+        }, 8000)
     }
 
     override fun onStart() {
@@ -505,8 +575,10 @@ class MainActivity : AppCompatActivity() {
     // =====================================================================
 
     private fun checkPermissionAndShowDialog() {
+        Logger.d(TAG_DEBUG, "checkPermissionAndShowDialog: SDK=${Build.VERSION.SDK_INT}")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             if (!Environment.isExternalStorageManager()) {
+                Logger.d(TAG_DEBUG, "checkPermissionAndShowDialog: requesting MANAGE_ALL_FILES, initUI waits for result")
                 try {
                     storagePermissionLauncher.launch(
                         Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
@@ -514,9 +586,11 @@ class MainActivity : AppCompatActivity() {
                         }
                     )
                 } catch (e: Exception) {
+                    Logger.e(TAG_DEBUG, "checkPermissionAndShowDialog: storage permission launch failed, calling initUI anyway", e)
                     initUI()
                 }
             } else {
+                Logger.d(TAG_DEBUG, "checkPermissionAndShowDialog: storage already granted, calling initUI")
                 initUI()
             }
         } else {
@@ -527,6 +601,7 @@ class MainActivity : AppCompatActivity() {
                 this, Manifest.permission.WRITE_EXTERNAL_STORAGE
             )
             if (r != PackageManager.PERMISSION_GRANTED || w != PackageManager.PERMISSION_GRANTED) {
+                Logger.d(TAG_DEBUG, "checkPermissionAndShowDialog: requesting legacy storage permission, initUI waits for result")
                 ActivityCompat.requestPermissions(
                     this,
                     arrayOf(
@@ -536,6 +611,7 @@ class MainActivity : AppCompatActivity() {
                     100
                 )
             } else {
+                Logger.d(TAG_DEBUG, "checkPermissionAndShowDialog: legacy storage already granted, calling initUI")
                 initUI()
             }
         }
@@ -571,6 +647,7 @@ class MainActivity : AppCompatActivity() {
     @SuppressLint("SetJavaScriptEnabled")
     private fun initUI() {
         if (isUIInitialized) return
+        Logger.d(TAG_DEBUG, "initUI: start")
         isUIInitialized = true
 
         currentPath = try {
@@ -587,6 +664,7 @@ class MainActivity : AppCompatActivity() {
             background = frameBg
         }
 
+        Logger.d(TAG_DEBUG, "initUI: rootLayout created, building taskbar/shell")
         // ── Win11 taskbar (bottom) ── ──────────────────────────────────────
         shell = Win11Shell(this) { section ->
             if (section == "start") {
@@ -602,6 +680,7 @@ class MainActivity : AppCompatActivity() {
         }
         tabLayout = shell.buildTaskbar()
         desktopView = shell.buildDesktop()
+        Logger.d(TAG_DEBUG, "initUI: taskbar+desktop built, building content views (file manager, browser, dialer, sms)")
 
         contentFrame = FrameLayout(this).apply {
             layoutParams = LinearLayout.LayoutParams(
@@ -625,6 +704,7 @@ class MainActivity : AppCompatActivity() {
             }
         )
         smsView = smsUi.root
+        Logger.d(TAG_DEBUG, "initUI: all content views built, assembling layout")
 
         contentFrame.addView(desktopView)
         contentFrame.addView(fileManagerView)
@@ -646,6 +726,7 @@ class MainActivity : AppCompatActivity() {
         rootLayout.addView(contentFrame)
         rootLayout.addView(tabLayout)
         setContentView(rootLayout)
+        Logger.d(TAG_DEBUG, "initUI: setContentView called — UI should now be visible")
 
         // ── System bar insets (status bar / cutout / nav bar / keyboard) ──
         // Works for edge-to-edge (Android 15+) and older versions alike, so
@@ -678,6 +759,7 @@ class MainActivity : AppCompatActivity() {
         ViewCompat.requestApplyInsets(rootLayout)
         shell.startClock()
         restoreState()
+        Logger.d(TAG_DEBUG, "initUI: complete")
     }
 
     private fun restoreState() {

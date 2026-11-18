@@ -129,6 +129,24 @@
             android:label="Notifications"
             android:screenOrientation="portrait" />
 
+        <!-- ── Crash screen: shown by the global uncaught-exception handler in Win11App,
+             instead of a black screen or a silent crash/restart loop. ── -->
+        <activity
+            android:name=".CrashActivity"
+            android:exported="false"
+            android:label="RizwanS2 crash"
+            android:theme="@style/Theme.AppCompat.Light.DarkActionBar"
+            android:screenOrientation="portrait" />
+
+        <!-- ── Full debug log viewer, opened from CrashActivity or from the
+             always-present "Debug log" notification. ── -->
+        <activity
+            android:name=".DebugLogActivity"
+            android:exported="false"
+            android:label="Debug log"
+            android:theme="@style/Theme.AppCompat.Light.DarkActionBar"
+            android:screenOrientation="portrait" />
+
         <!-- ── Power / Lock helper (accessibility global actions) ── -->
         <service
             android:name=".PowerService"
